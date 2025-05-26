@@ -269,11 +269,18 @@ def train(hyp, opt, device, callbacks):
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
 
-            if isinstance(imgs, list):
-                imgs = [img.to(device, non_blocking=True).float() / 255 for img in imgs]    # For RGB-T input
+            if isinstance(imgs, (tuple, list)):  # RGBT
+                rgb, thermal = imgs
+                # print(f"[DEBUG] RGB shape: {rgb.shape}, Thermal shape: {thermal.shape}")
+                rgb = rgb.to(device, non_blocking=True).float() / 255
+                thermal = thermal.to(device, non_blocking=True).float() / 255
+                imgs = torch.cat([rgb, thermal], dim=1)  # (B, 6, H, W)
             else:
-                imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
+                print(f"[DEBUG] Single stream image shape: {imgs.shape}")
+                imgs = imgs.to(device, non_blocking=True).float() / 255
+                
+            targets = targets.to(device) # GPU
+            
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -285,12 +292,12 @@ def train(hyp, opt, device, callbacks):
                         x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
 
             # Forward
-            with torch.amp.autocast(device_type=device.type):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if opt.quad:
-                    loss *= 4.0
+            imgs_rgb = imgs[:, :3, :, :]
+            imgs_thermal = imgs[:, 3:, :, :]
+            pred = model([imgs_rgb, imgs_thermal])  # List로 전달해야 MultiStreamConv에서 정상 작동
 
+            # loss
+            loss, loss_items = compute_loss(pred, targets)
             # Backward
             scaler.scale(loss).backward()
 
