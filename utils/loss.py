@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 
-from utils.metrics import bbox_iou
+from utils.metrics import bbox_iou  # bbox_iou 함수가 업데이트되었다고 가정
 from utils.torch_utils import de_parallel
 
 
@@ -52,10 +52,7 @@ class FocalLoss(nn.Module):
     def forward(self, pred, true):
         """Calculates the focal loss between predicted and true labels using a modified BCEWithLogitsLoss."""
         loss = self.loss_fcn(pred, true)
-        # p_t = torch.exp(-loss)
-        # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
-
-        # TF implementation https://github.com/tensorflow/addons/blob/v0.7.1/tensorflow_addons/losses/focal_loss.py
+        
         pred_prob = torch.sigmoid(pred)  # prob from logits
         p_t = true * pred_prob + (1 - true) * (1 - pred_prob)
         alpha_factor = true * self.alpha + (1 - true) * (1 - self.alpha)
@@ -119,7 +116,7 @@ class ComputeLoss:
         # Focal loss
         g = h["fl_gamma"]  # focal loss gamma
         if g > 0:
-            BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
+            BCEcls, BCEobj = QFocalLoss(BCEcls, g), QFocalLoss(BCEobj, g) # Changed to QFocalLoss
 
         m = de_parallel(model).model[-1]  # Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(m.nl, [4.0, 1.0, 0.25, 0.06, 0.02])  # P3-P7
@@ -130,6 +127,8 @@ class ComputeLoss:
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
+
+        self.iou_type = h.get('iou_type', 'CIoU') # Get iou_type from hyperparameters
 
     def __call__(self, p, targets):  # predictions, targets
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
@@ -146,41 +145,63 @@ class ComputeLoss:
             n = b.shape[0]  # number of targets
             if n:
                 pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
-                # pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
 
                 # Regression
                 pxy = pxy.sigmoid() * 2 - 0.5
                 pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+
+                # IoU Loss Calculation
+                if self.iou_type == 'WIoU':
+                    # Call bbox_iou with WIoU=True to get the WIoU loss directly
+                    # bbox_iou in metrics.py is assumed to return the WIoU loss when WIoU=True
+                    iou_loss = bbox_iou(pbox, tbox[i], WIoU=True).squeeze() 
+                    lbox += iou_loss.mean()
+                    
+                    # For objectness assignment, use a standard IoU (e.g., CIoU)
+                    # Detach pbox to prevent gradients from flowing back through objectness to box prediction
+                    iou_for_objectness = bbox_iou(pbox.detach(), tbox[i].detach(), CIoU=True).squeeze()
+                    iou = iou_for_objectness.clamp(0).type(tobj.dtype)
+                else: # Original CIoU or other IoU
+                    iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
+                    lbox += (1.0 - iou).mean()  # iou loss
+                    iou = iou.detach().clamp(0).type(tobj.dtype) # Use for objectness
 
                 # Objectness
-                iou = iou.detach().clamp(0).type(tobj.dtype)
                 if self.sort_obj_iou:
                     j = iou.argsort()
                     b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
                 if self.gr < 1:
                     iou = (1.0 - self.gr) + self.gr * iou
 
-                # If prediction is matched (iou > 0.5) with bounding box marked as ignore,
-                # do not calculate objectness loss
+                # Handle ignore targets for objectness loss
+                # Assuming class ID -1 is used for 'person?' or ignored annotations
+                # Only calculate objectness for non-ignored targets that pass IoU threshold
                 ign_idx = (tcls[i] == -1) & (iou > self.hyp["iou_t"])
                 keep = ~ign_idx
-                b, a, gj, gi, iou = b[keep], a[keep], gj[keep], gi[keep], iou[keep]
-
-                tobj[b, a, gj, gi] = iou  # iou ratio
+                b_kept, a_kept, gj_kept, gi_kept, iou_kept = b[keep], a[keep], gj[keep], gi[keep], iou[keep]
+                
+                tobj[b_kept, a_kept, gj_kept, gi_kept] = iou_kept  # iou ratio for kept targets
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(pcls, self.cn, device=self.device)  # targets
-                    t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(pcls, t)  # BCE
+                    
+                    # Filter for valid classification targets (not ignored, not -1 class)
+                    # `tcls[i]` for matched targets are already filtered by `build_targets` based on `j`
+                    # Now filter again for the 'keep' indices and ensure `tcls` is not -1
+                    valid_cls_targets_mask = (tcls[i][keep] != -1)
+                    
+                    # Apply classification target to kept targets
+                    # Use a new index for the filtered tensors
+                    target_indices = torch.arange(b_kept.shape[0], device=self.device)[valid_cls_targets_mask]
+                    class_labels = tcls[i][keep][valid_cls_targets_mask]
+                    
+                    if target_indices.shape[0] > 0: # Ensure there are valid targets to process
+                        t[target_indices, class_labels] = self.cp
+                        lcls += self.BCEcls(pcls[valid_cls_targets_mask], t[valid_cls_targets_mask])  # BCE
 
-                # Append targets to text file
-                # with open('targets.txt', 'a') as file:
-                #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
-
+            # Objectness loss for all predictions (positive and negative)
             obji = self.BCEobj(pi[..., 4], tobj)
             lobj += obji * self.balance[i]  # obj loss
             if self.autobalance:

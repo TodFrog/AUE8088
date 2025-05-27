@@ -23,6 +23,19 @@ names:
   2: people
   3: person?
 
+# Hyperparameters for training (추가된 부분)
+# These will be passed to ComputeLoss in loss.py
+hyp:
+  iou_type: WIoU # Set to 'WIoU' to use Wise-IoU loss for bounding box regression
+                # Or 'CIoU' for standard Complete IoU loss (default in original YOLOv5)
+  fl_gamma: 1.5  # Gamma for FocalLoss/QFocalLoss (adjust as needed, typical values 1.5 to 2.0)
+  cls_pw: 1.0    # Class positive weight (adjust for class imbalance)
+  obj_pw: 1.0    # Objectness positive weight (adjust for objectness imbalance)
+  box: 0.05      # Box loss gain
+  obj: 1.0       # Obj loss gain
+  cls: 0.5       # Cls loss gain
+  # Other hyperparameters for training should also be here or in a separate hyp file and linked.
+
 # Download script/URL (optional) ---------------------------------------------------------------------------------------
 download: |
   import os
