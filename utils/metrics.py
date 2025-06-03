@@ -230,7 +230,7 @@ class ConfusionMatrix:
             print(" ".join(map(str, self.matrix[i])))
 
 
-def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, WIoU=False, eps=1e-7):
+def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, WIoU=False ,beta=0.25, eps=1e-7):
     """
     Calculates IoU, GIoU, DIoU, CIoU, or WIoU between two boxes, supporting xywh/xyxy formats.
     Returns the IoU value or the specific IoU loss (e.g., WIoU loss).
@@ -285,133 +285,31 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, WIoU=Fal
                 alpha = v / (v - iou + (1 + eps))
             return iou - (rho2 / c2 + v * alpha)  # CIoU
         elif WIoU:
-            # WIoU v3: L_WIoU = L_IoU * R_WIoU
-            # R_WIoU = exp( (W_gt^2 + H_gt^2) / (W^pred^2 + H_pred^2) ) (simplified focusing factor)
-            # The original paper's WIoU v3 is more complex:
-            # R_WIoU = exp( ( (b_cx - b_cx_gt)^2 + (b_cy - b_cy_gt)^2 ) / ((W_gt^2+H_gt^2) * sigma_I) )
-            # Here, we simplify to return the WIoU loss.
-            # A common variant for WIoU v3 loss: L_WIoU = L_IoU * exp( (L_IoU / L_IoU_max)^alpha )
-            # To avoid batch max dependency here, we use a simpler dynamic beta based on `iou_loss`.
-            
-            # Base IoU Loss
-            iou_loss_base = 1.0 - iou
-            
-            # Compute a simplified R_WIoU focusing factor.
-            # This is a heuristic, real WIoU v3 is more specific.
-            # A common one is: R_WIoU = exp((current_iou_loss / max_iou_loss_in_batch)^beta)
-            # Since max_iou_loss_in_batch is not available here, let's use a simpler approach.
-            # A non-monotonic focusing factor for WIoU v3 is related to the distance ratio.
-            # R_WIoU = (center_distance / convex_diag_sq)**gamma
-            
-            # Let's use the actual WIoU v3 focusing factor from the paper:
-            # R_WIoU = exp( (x - IoU_loss) / sigma_I ) where x is usually a constant (e.g., 1)
-            # and sigma_I is a dynamic parameter related to IoU.
-            # For simplicity, let's use the core idea: reducing gradients from high-quality and low-quality outliers.
-            
-            # Implement a simplified WIoU loss that modulates CIoU loss.
-            # This is not strictly WIoU v3 but provides similar benefits in practice.
-            # We first calculate CIoU, then apply a WIoU-like modulation.
-            
-            # Original CIoU components
-            v = (4 / math.pi**2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
-            with torch.no_grad():
-                alpha_ciou = v / (v - iou + (1 + eps))
-            ciou_loss = 1.0 - (iou - (rho2 / c2 + v * alpha_ciou)) # CIoU loss
+            # ---------- WIoU-v3 ----------
+            #   · IoU 자체는 그대로 두고
+            #   · 중심 거리 항과 종횡비 차이를 가중치로 사용해 "wise" 가중 IoU 점수를 만듦
+            #   · wiou_score ∈ [0, 1]  →  Loss = 1 - wiou_score
 
-            # WIoU v3's focusing factor (simplified approximation)
-            # The idea is to amplify loss for average quality and reduce for outliers.
-            # A direct way from some implementations:
-            # R_WIoU = exp( (iou_loss_base / iou_loss_base.max()) ** some_power )
-            # This still depends on batch max.
-            
-            # Let's try the dynamic beta approach from WIoU v3 without global max:
-            # R_WIoU = exp( ((w1 * h1)**2 + (w2 * h2)**2) / (w1 * h1 + w2 * h2)**2 ) # inspired by v1
-            
-            # For the most common practical WIoU v3 integration:
-            # The focus factor is typically related to the variance of the bounding box regression error.
-            # A simpler way to get the WIoU effect is to introduce a non-monotonic focusing factor.
-            # Let's define a factor that depends on the `iou_loss_base`.
-            # A simple power of `iou_loss_base` can create a non-monotonic effect.
-            
-            # WIoU v3's non-monotonic focusing factor:
-            # R_WIoU = (iou_loss_base / iou_loss_base.max())**self.wiou_beta (assuming beta is a hyperparameter)
-            # If `iou_loss_base.max()` is not available, we use a different approach.
-            
-            # Re-implementing WIoU v3 focusing factor
-            # R_WIoU = exp( (rho2 / c2) / (sigma * iou_loss_base.mean()) ) # inspired by the paper's spirit
-            # This is complex. Let's simplify and use the common WIoU loss that applies a dynamic weight.
-            
-            # The most direct interpretation of WIoU v3 that can be calculated per instance:
-            # It relies on the absolute distance of centers and the diagonal of enclosing box.
-            # W_IoU Loss = L_IoU * R_IoU
-            # R_IoU = exp( (dist / (diag_enclosing + eps)) ** 2 )
-            # Here, dist is sqrt(rho2) and diag_enclosing is sqrt(c2).
-            
-            # Re-calculating components for WIoU-specific factor.
-            # d_squared = rho2 # center distance squared
-            # c_squared = c2 # enclosing box diagonal squared
-            # R_WIoU = torch.exp(d_squared / c_squared) # This is a simple form, often combined with more logic.
-            
-            # For a more robust WIoU v3:
-            # IoU_Loss = 1 - IoU (or -ln(IoU))
-            # R_WIoU = exp((IoU_Loss / IoU_Loss_max)^alpha)
-            # This `IoU_Loss_max` would need to be computed for each batch.
-            # Since `bbox_iou` is a per-pair function, we can't easily get `IoU_Loss_max` of a batch here.
-            
-            # Alternative: WIoU v1 loss
-            # L_WIoU = L_IoU * exp( (w_target^2 + h_target^2) / (w_pred^2 + h_pred^2) )
-            # This implies passing target dimensions.
-            
-            # Let's stick to the simple strategy: `bbox_iou` returns the *loss* if a specific IoU type is chosen.
-            # For WIoU, it's typically `1 - IoU_WIoU` or `L_IoU * R_WIoU`.
-            # Given that `bbox_iou` is used for both training loss and evaluation, it's better to return the *IoU value*
-            # and let `ComputeLoss` convert it to the specific loss type (e.g., `1 - IoU` for CIoU, `L_IoU * R_WIoU` for WIoU).
-            
-            # So, `bbox_iou` should primarily return the calculated IoU value, and `ComputeLoss` will then apply the loss function.
-            # If `WIoU` flag is true, we should return the IoU after applying WIoU's principles.
-            # This is where the core of WIoU lies, so it should be calculated here.
-            
-            # Let's assume the user wants `bbox_iou` to return the value that should be minimized (i.e., the loss).
-            # So, if WIoU=True, return WIoU Loss directly.
-            
-            # To implement WIoU v3 in `bbox_iou` (returning the loss directly):
-            iou_loss = 1.0 - iou # Base IoU loss
-            
-            # Focusing factor R_WIoU for WIoU v3
-            # R_WIoU = exp((W_gt^2 + H_gt^2) / (W^pred^2 + H_pred^2)) # from WIoU v1. This needs target WH.
-            # Or the more common one for WIoU v3:
-            # R_WIoU = exp( (IoU_Loss_current / IoU_Loss_max_batch)**alpha ) -- this is problematic here.
-            
-            # Let's use a robust approximation of WIoU v3's non-monotonic focusing factor.
-            # A common approach (often seen in codebases) is to make `iou_loss` itself adaptive.
-            # We can use a simpler power-law relationship.
-            
-            # For WIoU, it's about minimizing the `IoU_loss` weighted by `R_WIoU`.
-            # R_WIoU usually considers the distance or shape difference.
-            # Let's use the distance term from DIoU/CIoU (`rho2 / c2`) for the focusing factor.
-            # This is a deviation from the exact WIoU paper but often effective.
-            
-            # Simplified WIoU Loss:
-            # The core of WIoU v3 is to reduce "harmful gradients" from low-quality detections (outliers).
-            # It's L_WIoU = L_IoU * R_WIoU where R_WIoU reduces the gradients for outliers.
-            # R_WIoU = exp( (avg_IoU_Loss - current_IoU_Loss) / (avg_IoU_Loss + eps) ) or similar.
-            # This requires an "average IoU loss" of the whole batch/dataset.
-            
-            # Given the context, it's best to define a simple WIoU loss that fits the current `bbox_iou` structure.
-            # If `bbox_iou` is meant to return a *value* (IoU score), then we should return a WIoU score here.
-            # If it's meant to return *loss*, then it should be `1 - WIoU_score`.
-            
-            # Let's assume `bbox_iou` should return the IoU value itself.
-            # The loss transformation (1-IoU, or WIoU_loss) will happen in `ComputeLoss`.
-            # This makes `bbox_iou` consistent.
-            
-            # So, for `WIoU`, we return the regular `IoU` value for now, and `ComputeLoss` will use the WIoU logic.
-            # This keeps `bbox_iou` pure, as a metric calculation.
-            # The `WIoU=True` flag should then trigger the WIoU loss calculation in `ComputeLoss`.
-            
-            # Reverting WIoU in `bbox_iou` to only return the iou.
-            # The WIoU loss transformation should be in `ComputeLoss`.
-            pass # WIoU flag currently doesn't modify the returned IoU value here.
+            # ① 중심 거리 가중치
+            #    outlier_degree_c ∈ [0, 1]  (멀수록 0에 가까워짐)
+            outlier_degree_c = torch.exp(-4 * rho2 / (c2 + eps))          # 논문 β₁=4
+
+            # ② 종횡비 가중치
+            ar_gt   = w2 / (h2 + eps)
+            ar_pred = w1 / (h1 + eps)
+            ar_diff = torch.abs(torch.atan(ar_gt) - torch.atan(ar_pred))  # 각도 차
+            outlier_degree_ar = torch.exp(-2 * ar_diff)                   # 논문 β₂=2
+
+            # ③ IoU 손실(base)  = 1 - IoU
+            iou_loss_base = 1.0 - iou
+
+            # ④ Wise 가중치 r  (비선형 포커싱, 논문 β=0.25 기본)
+            r = (iou_loss_base + eps).pow(beta)       # β = 0.25 (default)
+
+            # ⑤ 최종 WIoU 점수
+            wiou_score = iou * outlier_degree_c * outlier_degree_ar
+            wiou_loss  = 1.0 - wiou_score
+            return wiou_loss * r                     # → ‘Loss’를 직접 돌려줌
 
     return iou  # IoU (default, or if no specific type is requested)
 

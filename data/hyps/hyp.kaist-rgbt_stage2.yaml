@@ -1,0 +1,43 @@
+# data/hyps/hyp.kaist-rgbt_stage2.yaml
+# Stage 2: Final Data Augmentation Hypers for RGBT (KAIST)
+lr0: 0.01
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+iou_type: WIoU     # CIoU 대신 WIoU 사용
+wiou_beta: 0.25    # 필요하면 추가 하이퍼파라미터
+
+# 손실
+box: 0.05
+cls: 0.50
+obj: 1.00
+cls_pw: 1.0
+obj_pw: 1.0
+iou_t: 0.20
+anchor_t: 4.0
+fl_gamma: 0.0
+
+# 기하 증강 ― 변경분 only
+scale: 0.80     # 기존 0.5 → 0.8 유지. RGBT 정렬 유지를 위해 너무 크게 변경하지 않음.
+mixup: 0.10     # MixUp 증강 활성화 (dataloaders.py에서 구현 필요)
+mosaic: 1.00    # Mosaic 증강 활성화 (dataloaders.py에서 구현 필요)
+copy_paste: 0.0 # RGBT 데이터셋 특성상 copy_paste는 신중하게 적용해야 함. (기존 0.0 유지)
+                # 만약 occlusion level에 대한 일관성 유지가 어렵다면 비활성화 유지.
+
+# 나머지 항목은 scratch-low 기본값 유지
+hsv_h: 0.015    # HSV Hue (Visible 이미지에만 영향)
+hsv_s: 0.70     # HSV Saturation (Visible 이미지에만 영향)
+hsv_v: 0.40     # HSV Value (Visible 이미지에만 영향)
+degrees: 0.0    # RGBT 이미지의 경우 두 모달리티의 정렬이 중요하므로 회전은 최소화 (0.0 유지)
+translate: 0.10 # RGBT 이미지의 정렬 유지를 위해 translate도 신중하게 (0.10 유지)
+shear: 0.0      # RGBT 이미지의 정렬 유지를 위해 shear도 신중하게 (0.0 유지)
+perspective: 0.0 # RGBT 이미지의 정렬 유지를 위해 perspective도 신중하게 (0.0 유지)
+flipud: 0.0     # 상하 반전 (기존 0.0 유지)
+fliplr: 0.50    # 좌우 반전 (기존 0.50 유지, RGBT 모두에 동일하게 적용)
+
+# 추가적으로 고려할 수 있는 Albumentations 파라미터 (augmentations.py Albumentations 클래스에서 정의)
+# rgb_blur: 0.0   # RGB 이미지에 블러 적용 (Visible 이미지에만 영향)
+# rgb_clahe: 0.0  # RGB 이미지에 CLAHE 적용 (Visible 이미지에만 영향)
