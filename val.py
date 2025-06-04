@@ -76,6 +76,7 @@ def save_one_json(predn, jdict, path, index, class_map):
     Example: {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
     """
     image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+    #image_id = id_map[path.name] 
     box = xyxy2xywh(predn[:, :4])  # xywh
     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
     for p, b in zip(predn.tolist(), box.tolist()):
@@ -215,7 +216,7 @@ def run(
     names = model.names if hasattr(model, "names") else model.module.names  # get class names
     if isinstance(names, (list, tuple)):  # old format
         names = dict(enumerate(names))
-    class_map = list(range(1000))
+    class_map =  [0, 1, 2,3]
     s = ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "P", "R", "mAP50", "mAP50-95")
     tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     dt = Profile(device=device), Profile(device=device), Profile(device=device)  # profiling times
@@ -263,29 +264,8 @@ def run(
         for si, pred in enumerate(preds):
             labels = targets[targets[:, 0] == si, 1:]
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
-            path = Path(paths[si])
+            path, shape = Path(paths[si]), shapes[si][0]
             index = indices[si]
-            # --- 수정 시작: shape 및 ratio_pad 정보 일관성 있게 정의 ---
-            current_shapes_info_for_sample = shapes[si] 
-            
-            # scale_boxes 및 다른 함수에서 사용할 변수들을 명확히 정의합니다.
-            shape_for_scaling: tuple  # 최종적으로 원본/모자이크 캔버스 크기 (h, w)를 가짐
-            ratio_pad_info: tuple or None # 최종적으로 (ratio, pad) 정보 또는 None을 가짐
-
-            if current_shapes_info_for_sample is None:  # 모자이크 등으로 shapes 정보가 None인 경우
-                # 모델 입력 이미지(ims[si])의 실제 크기를 "원본" 크기로 간주합니다.
-                # ims[si]는 (C, H, W) 형태의 텐서입니다.
-                h_model_input, w_model_input = ims[si].shape[1], ims[si].shape[2] 
-                shape_for_scaling = (h_model_input, w_model_input)
-                ratio_pad_info = None # 모자이크의 경우 ratio/pad 정보가 명시적으로 없음 (이미 최종 좌표계)
-            else: # shapes 정보가 있는 경우 (일반적으로 non-mosaic)
-                shape_for_scaling = current_shapes_info_for_sample[0]  # 원본 이미지 크기 (h0, w0)
-                ratio_pad_info = current_shapes_info_for_sample[1]   # ( (ratio_w, ratio_h), (pad_w, pad_h) )
-            
-            # 'shape' 변수는 val.py의 다른 부분 (예: save_one_txt)에서 사용될 수 있으므로,
-            # 이전 UnboundLocalError를 방지하기 위해 여기서 할당합니다.
-            shape = shape_for_scaling 
-
             correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
             seen += 1
 
@@ -300,29 +280,14 @@ def run(
             if single_cls:
                 pred[:, 5] = 0
             predn = pred.clone()
-
-            # --- 오류 발생 라인 수정 ---
-            # scale_boxes 호출 시, shapes[si][1] 대신 위에서 정의한 ratio_pad_info 변수를 사용합니다.
-            scale_boxes(ims[si].shape[1:3], predn[:, :4], shape, ratio_pad_info)
-            # --- 오류 발생 라인 수정 끝 ---
-
+            scale_boxes(ims[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
             # Evaluate
-            if nl: # Ground Truth (GT) 레이블이 있는 경우
-                # GT 레이블 (labels)은 이미 val.py 앞부분에서 모델 입력 크기 기준 pixel 좌표로 변환되어 있습니다.
-                # 이를 xyxy 형태로 변환합니다. (labels는 [cls, xc, yc, w, h] 형태)
-                gt_labels_xyxy_model_input_space = xywh2xyxy(labels[:, 1:5])
-                
-                # GT 박스도 예측 박스(predn)와 동일한 좌표계('shape' 변수가 나타내는 좌표계)로 변환합니다.
-                scaled_gt_boxes_xyxy = scale_boxes(
-                    ims[si].shape[1:3], 
-                    gt_labels_xyxy_model_input_space.clone(), # 복사본 전달
-                    shape, # predn과 동일한 타겟 좌표계
-                    ratio_pad_info # predn과 동일한 ratio/pad 정보 사용
-                )
-                labelsn = torch.cat((labels[:, 0:1], scaled_gt_boxes_xyxy), 1) # 최종 GT (네이티브 공간)
-                
-                correct = process_batch(predn, labelsn, iouv) # predn과 labelsn은 이제 동일 좌표계
+            if nl:
+                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                scale_boxes(ims[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
+                correct = process_batch(predn, labelsn, iouv)
                 if plots:
                     confusion_matrix.process_batch(predn, labelsn)
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
@@ -330,9 +295,7 @@ def run(
             # Save/log
             if save_txt:
                 (save_dir / "labels").mkdir(parents=True, exist_ok=True)
-                # save_one_txt는 'shape' (원본 또는 모자이크 H, W) 기준으로 정규화된 xywh를 저장
                 save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
-            
             if save_json:
                 save_one_json(predn, jdict, path, index, class_map)  # append to COCO-JSON dictionary
             callbacks.run("on_val_image_end", pred, predn, path, names, ims[si])
@@ -399,7 +362,7 @@ def run(
             # HACK: need to generate KAIST_annotation.json for your own validation set
             if not os.path.exists('utils/eval/KAIST_val-A_annotation.json'):
                 raise FileNotFoundError('Please generate KAIST_annotation.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
-            os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_val-A_annotation.json --rstFile {pred_json}")
+            os.system(f"python utils/eval/kaisteval.py --annFile utils/eval/KAIST_val-A_annotation.json --rstFile {pred_json}")
         except Exception as e:
             LOGGER.info(f"kaisteval unable to run: {e}")
 

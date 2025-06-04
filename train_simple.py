@@ -276,7 +276,7 @@ def train(hyp, opt, device, callbacks):
                 thermal = thermal.to(device, non_blocking=True).float() / 255
                 imgs = torch.cat([rgb, thermal], dim=1)  # (B, 6, H, W)
             else:
-                print(f"[DEBUG] Single stream image shape: {imgs.shape}")
+                #print(f"[DEBUG] Single stream image shape: {imgs.shape}")
                 imgs = imgs.to(device, non_blocking=True).float() / 255
                 
             targets = targets.to(device) # GPU

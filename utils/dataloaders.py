@@ -1466,7 +1466,8 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                     xyxy2xywhn(labels_mosaic_np[:, 1:5].copy(),
                             w=w_img, h=h_img, clip=True, eps=1e-3)
                 )
-
+                #print(labels_out[:, 2:6].min(), labels_out[:, 2:6].max())
+                
                 # 3) occlusion 값 있으면 보존
                 if labels_mosaic_np.shape[1] == 6:
                     labels_out[:, 6] = torch.from_numpy(labels_mosaic_np[:, 5])

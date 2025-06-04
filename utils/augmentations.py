@@ -292,28 +292,11 @@ def cutout(im, labels, p=0.5):
     return labels
 
 
-def mixup(imgs1, labels1, imgs2, labels2):
-    """
-    Applies MixUp augmentation for RGBT images by blending image pairs and labels.
-    imgs1: tuple (lwir_img1, vis_img1)
-    imgs2: tuple (lwir_img2, vis_img2)
-    labels1, labels2: numpy arrays of labels
-    """
-    lwir_img1, vis_img1 = imgs1[0], imgs1[1]
-    lwir_img2, vis_img2 = imgs2[0], imgs2[1]
-
-    r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
-
-    # Apply mixup to LWIR images
-    mixed_lwir_img = (lwir_img1 * r + lwir_img2 * (1 - r)).astype(np.uint8)
-
-    # Apply mixup to Visible images
-    mixed_vis_img = (vis_img1 * r + vis_img2 * (1 - r)).astype(np.uint8)
-
-    # Concatenate labels from both image pairs
-    combined_labels = np.concatenate((labels1, labels2), 0)
-
-    return (mixed_lwir_img, mixed_vis_img), combined_labels
+def mixup(im, labels, im2, labels2):
+    r = np.random.beta(32.0, 32.0)
+    im = (im * r + im2 * (1 - r)).astype(np.uint8)
+    labels = np.concatenate((labels, labels2), 0)
+    return im, labels
 
 
 def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):

@@ -144,29 +144,29 @@ class ComputeLoss:
             tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
 
             n = b.shape[0]  # number of targets
-            iou = torch.zeros(n, device=self.device)   # ← (1) 기본값 확보
-            # --- 추가할 디버깅 코드 ---
-            # print(f"[DEBUG] __call__: Layer {i}, Initial number of targets (n) for loss calc: {n}")
-            # --- 디버깅 코드 끝 ---
-            
             if n:
-                # 1) 예측·타깃 박스
-                pxy, pwh, _, pcls_pred = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)
-                pred_boxes   = torch.cat((pxy, pwh), 1)          # (n,4) xywh
-                target_boxes = tbox[i]                           # (n,4) xywh
+                pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
 
-                # 2) IoU/Loss 계산 – iou_type 에 따라 분기
+                # Regression
+                pxy = pxy.sigmoid() * 2 - 0.5
+                pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
+                pbox = torch.cat((pxy, pwh), 1)  # predicted box
+
+                # IoU Loss Calculation
                 if self.iou_type == 'WIoU':
-                    wiou_loss = bbox_iou(pred_boxes, target_boxes,
-                                        xywh=True, WIoU=True, beta=self.wiou_beta)  # ← LOSS
-                    lbox += wiou_loss.mean()
-                    iou = (1.0 - wiou_loss).detach().squeeze()    # ← 0-1 점수로 **대입**
-
-                elif self.iou_type == 'CIoU':
-                    ciou = bbox_iou(pred_boxes, target_boxes,
-                                    xywh=True, CIoU=True)         # ← 0-1 점수
-                    lbox += (1.0 - ciou).mean()
-                    iou = ciou.detach().squeeze()                 # ← **대입**
+                    # Call bbox_iou with WIoU=True to get the WIoU loss directly
+                    # bbox_iou in metrics.py is assumed to return the WIoU loss when WIoU=True
+                    iou_loss = bbox_iou(pbox, tbox[i], WIoU=True).squeeze() 
+                    lbox += iou_loss.mean()
+                    
+                    # For objectness assignment, use a standard IoU (e.g., CIoU)
+                    # Detach pbox to prevent gradients from flowing back through objectness to box prediction
+                    iou_for_objectness = bbox_iou(pbox.detach(), tbox[i].detach(), CIoU=True).squeeze()
+                    iou = iou_for_objectness.clamp(0).type(tobj.dtype)
+                else: # Original CIoU or other IoU
+                    iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
+                    lbox += (1.0 - iou).mean()  # iou loss
+                    iou = iou.detach().clamp(0).type(tobj.dtype) # Use for objectness
 
                 
 
@@ -184,21 +184,25 @@ class ComputeLoss:
                 keep = ~ign_idx
                 b_kept, a_kept, gj_kept, gi_kept, iou_kept = b[keep], a[keep], gj[keep], gi[keep], iou[keep]
                 
-                tobj[b_kept, a_kept, gj_kept, gi_kept] = iou_kept  # iou ratio for kept targets
+                tobj[b_kept, a_kept, gj_kept, gi_kept] = iou_kept.clamp(0, 1)  # iou ratio for kept targets
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(pcls_pred, self.cn, device=self.device)  # targets
+                    t = torch.full_like(pcls, self.cn, device=self.device)  # targets
                     
                     # Filter for valid classification targets (not ignored, not -1 class)
                     # `tcls[i]` for matched targets are already filtered by `build_targets` based on `j`
                     # Now filter again for the 'keep' indices and ensure `tcls` is not -1
-                    valid = (tcls[i][keep] != -1)
-                    if valid.any():
-                        idx = torch.arange(b_kept.shape[0], device=self.device)[valid]
-                        cls  = tcls[i][keep][valid]
-                        t[idx, cls] = self.cp
-                        lcls += self.BCEcls(pcls_pred[valid], t[valid])
+                    valid_cls_targets_mask = (tcls[i][keep] != -1)
+                    
+                    # Apply classification target to kept targets
+                    # Use a new index for the filtered tensors
+                    target_indices = torch.arange(b_kept.shape[0], device=self.device)[valid_cls_targets_mask]
+                    class_labels = tcls[i][keep][valid_cls_targets_mask]
+                    
+                    if target_indices.shape[0] > 0: # Ensure there are valid targets to process
+                        t[target_indices, class_labels] = self.cp
+                        lcls += self.BCEcls(pcls[valid_cls_targets_mask], t[valid_cls_targets_mask])  # BCE
 
             # Objectness loss for all predictions (positive and negative)
             obji = self.BCEobj(pi[..., 4], tobj)
@@ -244,7 +248,7 @@ class ComputeLoss:
         for i in range(self.nl):
             anchors, shape = self.anchors[i], p[i].shape
             gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
-
+            
             # Match targets to anchors
             t = targets * gain  # shape(3,n,7)
             if nt:
@@ -278,8 +282,12 @@ class ComputeLoss:
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
             
-            #if not tcls: # 만약 tcls 리스트가 비어있다면 (아무 레이어에서도 타겟을 못 찾음)
-            #    print(f"{'='*20} build_targets: NO TARGETS BUILT FOR ANY LAYER {'='*20}")
+            #print(f"Layer {i}: targets = {tcls[i].shape[0]}, valid = {(tcls[i] != -1).sum()}")
+            
+            
+            if not tcls: # 만약 tcls 리스트가 비어있다면 (아무 레이어에서도 타겟을 못 찾음)
+                print(f"{'='*20} build_targets: NO TARGETS BUILT FOR ANY LAYER {'='*20}")
+                print(f"[WARNING] No targets matched in any layer") 
             #else:
             #    for layer_idx in range(self.nl):
             #        if layer_idx < len(tcls) and tcls[layer_idx] is not None:
