@@ -56,7 +56,6 @@ from utils.general import (
     xyxy2xywhn,
 )
 from utils.torch_utils import torch_distributed_zero_first
-from utils.general import xyxy2xywhn
 
 # Parameters
 HELP_URL = "See https://docs.ultralytics.com/yolov5/tutorials/train_custom_data"
@@ -776,197 +775,81 @@ class LoadImagesAndLabels(Dataset):
     #     return self
 
     def __getitem__(self, index):
+        """Fetches the dataset item at the given index, considering linear, shuffled, or weighted sampling."""
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
-        
-        shapes = None  # shapes는 non-mosaic 경로에서 설정되므로 초기화
-        imgs_to_return = [] # 최종 반환될 이미지 텐서 리스트
-        
-        if mosaic_active:
-            # Load mosaic for RGBT
-            # self.load_mosaic는 ( (lwir_np, vis_np), labels_np_Nx6 )를 반환합니다.
-            # labels_np_Nx6: [cls, xc_norm, yc_norm, w_norm, h_norm, occ_level]
-            imgs_mosaic_np_tuple, labels_mosaic_np = self.load_mosaic(index) 
-            
-            if random.random() < hyp.get("mixup", 0.0):
-                imgs2_mosaic_np_tuple, labels2_mosaic_np = self.load_mosaic(random.choice(self.indices))
-                # 사용자 정의 RGBT mixup 함수 사용
-                imgs_mosaic_np_tuple, labels_mosaic_np = mixup(
-                    imgs_mosaic_np_tuple, labels_mosaic_np, imgs2_mosaic_np_tuple, labels2_mosaic_np
+        if mosaic:
+            # Load mosaic
+            img, labels = self.load_mosaic(index)
+            shapes = None
+
+            # MixUp augmentation
+            if random.random() < hyp["mixup"]:
+                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+
+        else:
+            # Load image
+            img, (h0, w0), (h, w) = self.load_image(index)
+
+            # Letterbox
+            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
+            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+
+            labels = self.labels[index].copy()
+            if labels.size:  # normalized xywh to pixel xyxy format
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+            if self.augment:
+                img, labels = random_perspective(
+                    img,
+                    labels,
+                    degrees=hyp["degrees"],
+                    translate=hyp["translate"],
+                    scale=hyp["scale"],
+                    shear=hyp["shear"],
+                    perspective=hyp["perspective"],
                 )
 
-            nl = len(labels_mosaic_np)
-            # labels_out: [batch_idx_placeholder, cls, xc, yc, w, h, occ_level]
-            labels_out = torch.zeros((nl, 7)) 
-            if nl:
-                labels_out[:, 1:] = torch.from_numpy(labels_mosaic_np)
-            
-            # 모자이크 NumPy 이미지들을 Tensor로 변환
-            for img_modality_np in imgs_mosaic_np_tuple: # (lwir_np, vis_np)
-                img_tensor = img_modality_np.transpose((2, 0, 1))  # HWC to CHW
-                if img_tensor.shape[0] == 3:  # 3채널 이미지 (BGR -> RGB 가정)
-                    img_tensor = img_tensor[::-1, :, :] 
-                img_tensor = np.ascontiguousarray(img_tensor)
-                imgs_to_return.append(torch.from_numpy(img_tensor))
+        nl = len(labels)  # number of labels
+        if nl:
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
 
-        else: # Not mosaic
-            imgs_modalities_np, hw0s_orig_list, hw_resized_list = self.load_image(index) 
-            
-            # non-mosaic 경로에서 최종 레이블 (증강 적용 후, NumPy 형태)
-            # self.labels[index]는 [cls, xc, yc, w, h, occ] 형태의 정규화된 NumPy 배열
-            labels_processed_np_final = self.labels[index].copy() 
-                                                            
-            M_random_perspective = None # random_perspective 변환 행렬 공유용
+        if self.augment:
+            # Albumentations
+            img, labels = self.albumentations(img, labels)
+            nl = len(labels)  # update after albumentations
 
-            temp_processed_imgs_tensors = [] # 각 모달리티의 최종 처리된 텐서를 임시 저장
+            # HSV color-space
+            augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
 
-            for ii, (img_np, hw0_tuple, hw_resized_tuple) in enumerate(zip(imgs_modalities_np, hw0s_orig_list, hw_resized_list)):
-                h0_orig, w0_orig = hw0_tuple # 원본 높이, 너비
-                # h_resized, w_resized = hw_resized_tuple # letterbox 이전 리사이즈된 크기
+            # Flip up-down
+            if random.random() < hyp["flipud"]:
+                img = np.flipud(img)
+                if nl:
+                    labels[:, 2] = 1 - labels[:, 2]
 
-                target_shape_for_letterbox = self.batch_shapes[self.batch[index]] if self.rect else self.img_size
-                img_lb_np, ratio_tuple, pad_tuple = letterbox(img_np.copy(), target_shape_for_letterbox, auto=False, scaleup=self.augment)
-                
-                if ii == 0: 
-                    shapes = (h0_orig, w0_orig), (ratio_tuple, pad_tuple) # COCO mAP 리스케일링용 정보
+            # Flip left-right
+            if random.random() < hyp["fliplr"]:
+                img = np.fliplr(img)
+                if nl:
+                    labels[:, 1] = 1 - labels[:, 1]
 
-                current_labels_np_norm = self.labels[index].copy() # [cls, xc, yc, w, h, occ]
-                
-                # 레이블 좌표 변환: normalized xywh -> pixel xyxy (letterboxed 이미지 기준)
-                labels_pixel_xyxy_on_lb = np.zeros((len(current_labels_np_norm), 5)) # cls, x1,y1,x2,y2
-                if current_labels_np_norm.size > 0:
-                    labels_pixel_xyxy_on_lb[:, 0] = current_labels_np_norm[:, 0]
-                    # xywhn2xyxy는 정규화된 xc,yc,w,h를 입력받아 pixel xyxy로 변환
-                    # 이 때 사용되는 w, h는 정규화의 기준이 되었던 이미지 크기 (letterbox 적용 전, 패딩 추가 전의 이미지 크기)
-                    # 즉, ratio_tuple[0] * w0_orig, ratio_tuple[1] * h0_orig 가 됩니다.
-                    # 혹은 letterbox 함수 내부의 new_unpad 크기입니다.
-                    w_unpadded_resized = int(round(w0_orig * ratio_tuple[0]))
-                    h_unpadded_resized = int(round(h0_orig * ratio_tuple[1]))
+            # Cutouts
+            # labels = cutout(img, labels, p=0.5)
+            # nl = len(labels)  # update after cutout
 
-                    labels_pixel_xyxy_on_lb[:, 1:5] = xywhn2xyxy(
-                        current_labels_np_norm[:, 1:5].copy(), # xc, yc, w, h 부분만 전달
-                        w=w_unpadded_resized, 
-                        h=h_unpadded_resized, 
-                        padw=pad_tuple[0], 
-                        padh=pad_tuple[1]
-                    )
-                
-                img_to_augment_np = img_lb_np # 증강은 letterbox된 이미지에 적용
-                labels_for_augment_xyxy = labels_pixel_xyxy_on_lb # pixel xyxy 형태
+        labels_out = torch.zeros((nl, 6))
+        if nl:
+            labels_out[:, 1:] = torch.from_numpy(labels)
 
-                if self.augment:
-                    # random_perspective 적용 (labels_for_augment_xyxy는 pixel xyxy)
-                    current_segments = self.segments[index].copy() if self.segments and self.segments[index] else []
-                    # segments도 pixel 좌표로 변환 필요 (random_perspective는 pixel 좌표를 가정)
-                    if current_segments and labels_for_augment_xyxy.size > 0 : # 세그먼트가 있고 레이블도 있을 때
-                        # xyn2xy 함수는 정규화된 segment 좌표를 pixel 좌표로 변환
-                        # 이 때 사용되는 w, h도 위와 동일하게 w_unpadded_resized, h_unpadded_resized 사용
-                        segments_pixel = [xyn2xy(seg, w=w_unpadded_resized, h=h_unpadded_resized, padw=pad_tuple[0], padh=pad_tuple[1]) for seg in current_segments]
-                    else:
-                        segments_pixel = []
+        # Convert
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img = np.ascontiguousarray(img)
 
-                    if ii == 0: 
-                        img_to_augment_np, labels_for_augment_xyxy, M_random_perspective = random_perspective(
-                            img_to_augment_np,
-                            labels_for_augment_xyxy, # [cls, x1,y1,x2,y2]
-                            segments_pixel,
-                            degrees=hyp.get("degrees", 0.0), translate=hyp.get("translate", 0.0),
-                            scale=hyp.get("scale", 0.0), shear=hyp.get("shear", 0.0),
-                            perspective=hyp.get("perspective", 0.0)
-                        )
-                    else: 
-                        img_to_augment_np, _, _ = random_perspective(img_to_augment_np, M=M_random_perspective)
-                        # labels_for_augment_xyxy는 첫 번째 모달리티 기준으로 이미 변환됨
-
-                    # Albumentations (pixel xyxy 레이블을 YOLO 포맷으로 변환하여 전달)
-                    if self.albumentations and labels_for_augment_xyxy.size > 0:
-                        h_img_for_alb, w_img_for_alb = img_to_augment_np.shape[:2]
-                        # labels_for_augment_xyxy ([cls, x1,y1,x2,y2]) -> YOLO 포맷 ([xc_norm, yc_norm, w_norm, h_norm])
-                        labels_yolo_for_alb = np.zeros((len(labels_for_augment_xyxy), 5))
-                        labels_yolo_for_alb[:,0] = labels_for_augment_xyxy[:,0]
-                        labels_yolo_for_alb[:,1:] = xyxy2xywhn(labels_for_augment_xyxy[:,1:5].copy(), w=w_img_for_alb, h=h_img_for_alb, clip=True, eps=1e-3)
-
-                        transformed = self.albumentations( # Albumentations 클래스는 YOLO 포맷을 받는다고 가정
-                            image=img_to_augment_np, 
-                            bboxes=labels_yolo_for_alb[:, 1:].tolist(),
-                            class_labels=labels_yolo_for_alb[:, 0].tolist()
-                        )
-                        img_to_augment_np = transformed['image']
-                        if ii == 0: # 레이블은 첫 번째 모달리티 기준으로만 업데이트
-                            labels_from_alb_yolo = np.array(transformed['bboxes'])
-                            if labels_from_alb_yolo.size > 0:
-                                # Albumentations 반환 (YOLO 포맷) -> pixel xyxy로 다시 변환하여 labels_for_augment_xyxy 업데이트
-                                labels_for_augment_xyxy[:,1:5] = xywhn2xyxy(labels_from_alb_yolo, w=img_to_augment_np.shape[1], h=img_to_augment_np.shape[0])
-                            else:
-                                labels_for_augment_xyxy = np.array([])
-
-
-                    # HSV (Visible 이미지, 즉 ii == 1 일 때만 적용 가정)
-                    if ii == 1: 
-                        augment_hsv(img_to_augment_np, hgain=hyp.get("hsv_h",0.0), sgain=hyp.get("hsv_s",0.0), vgain=hyp.get("hsv_v",0.0))
-
-                    # Flip (이미지에 적용 후, 레이블은 ii == 0 일 때만 업데이트)
-                    if random.random() < hyp.get("flipud",0.0):
-                        img_to_augment_np = np.flipud(img_to_augment_np)
-                        if ii == 0 and labels_for_augment_xyxy.size > 0:
-                            labels_for_augment_xyxy[:, [2, 4]] = img_to_augment_np.shape[0] - labels_for_augment_xyxy[:, [4, 2]] 
-
-                    if random.random() < hyp.get("fliplr",0.0):
-                        img_to_augment_np = np.fliplr(img_to_augment_np)
-                        if ii == 0 and labels_for_augment_xyxy.size > 0:
-                            labels_for_augment_xyxy[:, [1, 3]] = img_to_augment_np.shape[1] - labels_for_augment_xyxy[:, [3, 1]] 
-                    
-                if ii == 0: # 최종 증강된 레이블(pixel xyxy)을 labels_processed_final_np에 저장
-                    labels_processed_final_np = labels_for_augment_xyxy # [cls, x1,y1,x2,y2]
-
-                # 이미지 NumPy 배열을 Tensor로 변환
-                img_tensor = img_to_augment_np.transpose((2, 0, 1))  # HWC to CHW
-                if img_tensor.shape[0] == 3: # 3채널 (BGR -> RGB)
-                    img_tensor = img_tensor[::-1, :, :]
-                img_tensor = np.ascontiguousarray(img_tensor)
-                temp_processed_imgs_tensors.append(torch.from_numpy(img_tensor))
-            
-            # non-mosaic 경로의 최종 레이블 처리 (pixel xyxy -> normalized xywh 및 occlusion 포함하여 labels_out 생성)
-            # ---------- MOSAIC ----------
-            nl = len(labels_mosaic_np)
-            labels_out = torch.zeros((nl, 7))
-            if nl:
-                labels_out[:, 1:] = torch.from_numpy(labels_mosaic_np)   # cls, xc, yc, w, h, occ
-            # -----------------------------------------------------------
-
-
-            # ---------- NON-MOSAIC ----------
-            nl = len(labels_processed_final_np)
-            labels_out = torch.zeros((nl, 7))
-            if nl:
-                # cls
-                labels_out[:, 1] = torch.from_numpy(labels_processed_final_np[:, 0])
-
-                # pixel xyxy ➜ normalised xywh (최종 이미지 크기 기준)
-                h_f, w_f = temp_processed_imgs_tensors[0].shape[1:3]
-                labels_out[:, 2:6] = torch.from_numpy(
-                    xyxy2xywhn(labels_processed_final_np[:, 1:5].copy(),
-                            w=w_f, h=h_f, clip=True, eps=1e-3)
-                )
-
-                # occlusion
-                if self.labels[index].shape[1] == 6 and len(self.labels[index]) == nl:
-                    labels_out[:, 6] = torch.from_numpy(self.labels[index][:, 5])
-
-            imgs_to_return = temp_processed_imgs_tensors
-
-
-        # 공통 로직: labels_out의 마지막 컬럼 (occlusion level) 제거하여 최종 (N, 6) 형태로 만듦
-        # labels_out은 이 시점에서 (N, 7) [batch_idx_placeholder, cls, xc, yc, w, h, occ] 형태를 가집니다.
-        if labels_out.shape[1] == 7: # 7개의 컬럼을 가지고 있다면
-             labels_out = labels_out[:, :-1] # 마지막 occlusion level 컬럼 제거 -> (N, 6)
-        elif len(labels_out) > 0 and labels_out.shape[1] != 6: # 레이블이 있는데 컬럼 수가 6이 아니면 경고
-            LOGGER.warning(f"labels_out has unexpected shape {labels_out.shape} before final processing for {self.im_files[index]}. Expected 6 or 7 columns.")
-        # 만약 nl == 0 이면 labels_out은 (0,7) 또는 (0,6) 이고, 슬라이싱은 문제 없음.
-
-        return imgs_to_return, labels_out, self.im_files[index], shapes, index
+        return torch.from_numpy(img), labels_out, self.im_files[index], shapes, index
 
     def load_image(self, i):
         """
@@ -1003,9 +886,7 @@ class LoadImagesAndLabels(Dataset):
         """Loads a 4-image mosaic for YOLOv5, combining 1 selected and 3 random images, with labels and segments."""
         labels4, segments4 = [], []
         s = self.img_size
-        border_x, border_y = self.mosaic_border
-        xc = int(random.uniform(-border_x, 2 * s + border_x))
-        yc = int(random.uniform(-border_y, 2 * s + border_y))  # mosaic center x, y
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
         indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
         random.shuffle(indices)
         for i, index in enumerate(indices):
@@ -1214,7 +1095,7 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
         super().__init__(path, **kwargs)
 
         # TODO: make mosaic augmentation work
-        self.mosaic = True
+        self.mosaic = False
 
         # Set ignore flag
         cond = self.ignore_settings['train' if is_train else 'test']
@@ -1312,343 +1193,93 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
             if not f.exists():
                 np.save(f.as_posix(), cv2.imread(self.im_files[i].format(m)))
 
-    def load_mosaic(self, index):
-        # Loads 4 RGBT image mosaic into a single image, labels, and segments
-        labels4, segments4 = [], []
-        s = self.img_size
-        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
-        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
-        random.shuffle(indices)
-
-        # Initialize img4 for both modalities
-        # Assuming imgs will return a tuple (lwir_img, visible_img)
-        temp_imgs_modalities, _, _ = self.load_image(indices[0])
-        temp_img_lwir_shape = temp_imgs_modalities[0].shape
-        temp_img_vis_shape = temp_imgs_modalities[1].shape
-        
-        img4_lwir = np.full((s * 2, s * 2, temp_img_lwir_shape[2] if len(temp_img_lwir_shape) == 3 else 1), 114, dtype=np.uint8)
-        img4_vis = np.full((s * 2, s * 2, temp_img_vis_shape[2]), 114, dtype=np.uint8)
-
-        for i, index_loop_var in enumerate(indices): # 루프 변수명 변경
-            # Load images for both modalities
-            imgs_modalities, _, resized_shapes_per_modality = self.load_image(index_loop_var)
-            img_lwir, img_vis = imgs_modalities[0], imgs_modalities[1]
-            h, w = resized_shapes_per_modality[0]
-            # 이제 resized_shapes_per_modality 변수가 정의되었으므로 아래 라인에서 사용 가능
-            h, w = resized_shapes_per_modality[0]
-
-            # place img in img4
-            if i == 0:  # top left
-                # img4_lwir, img4_vis 초기화는 루프 밖으로 이동했으므로 여기서는 좌표 계산만 수행
-                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
-            elif i == 1:  # top right
-                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
-                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
-            elif i == 2:  # bottom left
-                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
-            elif i == 3:  # bottom right
-                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
-
-            img4_lwir[y1a:y2a, x1a:x2a] = img_lwir[y1b:y2b, x1b:x2b]
-            img4_vis[y1a:y2a, x1a:x2a] = img_vis[y1b:y2b, x1b:x2b]
-
-            padw = x1a - x1b
-            padh = y1a - y1b
-
-            # Labels
-            labels, segments = self.labels[index].copy(), self.segments[index].copy()
-            if labels.size:
-                # normalized xywh to pixel xyxy format
-                labels[:, 1:3] += labels[:, 3:5] / 2.0 # (x_lefttop, y_lefttop) -> (x_center, y_center) for proper scaling
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)
-                segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
-            labels4.append(labels)
-            segments4.extend(segments)
-
-        # Concat/clip labels
-        labels4 = np.concatenate(labels4, 0)
-        for x in (labels4[:, 1:], *segments4):
-            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
-
-        # Augment - apply random_perspective to both modalities
-        img4_lwir, labels4_transformed, M_transform = random_perspective(
-            img4_lwir,
-            labels4.copy(), # 원본 labels4를 변경하지 않도록 .copy() 사용 권장
-            segments4.copy() if segments4 else [], # segments4도 복사본 사용 또는 빈 리스트 전달
-            degrees=self.hyp.get("degrees", 0.0), # hyp 딕셔너리에 키가 없을 경우를 대비해 .get() 사용
-            translate=self.hyp.get("translate", 0.0),
-            scale=self.hyp.get("scale", 0.0),
-            shear=self.hyp.get("shear", 0.0),
-            perspective=self.hyp.get("perspective", 0.0),
-            border=self.mosaic_border,
-        )
-        img4_vis, _, _ = random_perspective( 
-            img4_vis,
-            (), 
-            (), 
-            degrees=self.hyp.get("degrees", 0.0),
-            translate=self.hyp.get("translate", 0.0),
-            scale=self.hyp.get("scale", 0.0),
-            shear=self.hyp.get("shear", 0.0),
-            perspective=self.hyp.get("perspective", 0.0),
-            border=self.mosaic_border,
-            M=M_transform
-        )
-        
-        p_copy_paste = self.hyp.get("copy_paste", 0.0)
-        
-        # copy_paste를 위한 최종 이미지와 레이블 변수 초기화
-        final_img_lwir = img4_lwir
-        final_img_vis = img4_vis
-        final_labels = labels4_transformed # random_perspective 후의 레이블
-        final_segments = segments4 # random_perspective 후의 세그먼트 (만약 수정되었다면)
-
-        if p_copy_paste > 0:
-            LOGGER.warning("RGBT Copy-Paste is active (p > 0) but using a non-RGBT aware function. Augmentations might be inconsistent.")
-            
-
-            final_img_lwir, final_labels, final_segments = copy_paste(
-                img4_lwir, 
-                labels4_transformed.copy(), # copy_paste에 전달할 때는 복사본 사용
-                segments4.copy() if segments4 else [], 
-                p=p_copy_paste
-            )
-
-            final_img_vis, _, _ = copy_paste(
-                img4_vis, 
-                labels4_transformed.copy(), # 변환 전 레이블을 사용할지, 첫번째 copy_paste 후 레이블을 사용할지 정책 필요
-                                           # 여기서는 random_perspective 후의 레이블을 사용
-                segments4.copy() if segments4 else [], 
-                p=p_copy_paste
-            )
-            # 참고: 위와 같이 두 번 호출하면 각 이미지에 대해 다른 랜덤 샘플링이 copy_paste 내부에서 발생할 수 있습니다.
-
-        return (final_img_lwir, final_img_vis), final_labels
-    
-# D:\AUE8088\utils\dataloaders.py LoadRGBTImagesAndLabels 클래스 내 __getitem__ 메소드
-
     def __getitem__(self, index):
+        """Fetches the dataset item at the given index, considering linear, shuffled, or weighted sampling."""
         index = self.indices[index]  # linear, shuffled, or image_weights
+
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
-        
-        shapes = None  # shapes는 non-mosaic 경로에서 설정되므로 초기화
-        imgs_to_return = None # 최종 반환될 이미지 텐서 리스트
-
         if mosaic:
-            # Load mosaic for RGBT
-            # self.load_mosaic는 ( (lwir_np, vis_np), labels_np_Nx6 )를 반환합니다.
-            imgs_mosaic_np, labels_mosaic_np = self.load_mosaic(index) 
-            
-            # MixUp augmentation for RGBT
+            raise NotImplementedError('Please make "mosaic" augmentation work!')
+
+            # TODO: Load mosaic
+            img, labels = self.load_mosaic(index)
+            shapes = None
+
+            # TODO: MixUp augmentation
             if random.random() < hyp["mixup"]:
-                # mixup 함수는 ((lwir1, vis1), labels1, (lwir2, vis2), labels2)를 받아
-                # ((mixed_lwir, mixed_vis), combined_labels)를 반환합니다.
-                imgs2_mosaic_np_tuple, labels2_mosaic_np = self.load_mosaic(random.choice(self.indices))
-                imgs_mosaic_np, labels_mosaic_np = mixup(
-                    imgs_mosaic_np, labels_mosaic_np, imgs2_mosaic_np_tuple, labels2_mosaic_np
-                )
+                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
 
-            nl = len(labels_mosaic_np)
-            # labels_mosaic_np는 [cls, x, y, w, h, occ_level] 형태의 NumPy 배열입니다.
-            # labels_out은 [batch_idx_placeholder, cls, x, y, w, h, occ_level] 형태의 Tensor가 됩니다.
-            labels_out = torch.zeros((nl, 7)) 
-            if nl:
-                # 1) 클래스 번호
-                labels_out[:, 1] = torch.from_numpy(labels_mosaic_np[:, 0])
-
-                # 2) pixel xyxy → normalised xywh
-                h_img, w_img = imgs_mosaic_np[0].shape[:2]   # 두 모달리티 크기는 동일
-                labels_out[:, 2:6] = torch.from_numpy(
-                    xyxy2xywhn(labels_mosaic_np[:, 1:5].copy(),
-                            w=w_img, h=h_img, clip=True, eps=1e-3)
-                )
-                #print(labels_out[:, 2:6].min(), labels_out[:, 2:6].max())
-                
-                # 3) occlusion 값 있으면 보존
-                if labels_mosaic_np.shape[1] == 6:
-                    labels_out[:, 6] = torch.from_numpy(labels_mosaic_np[:, 5])
-                        
-            # 모자이크 NumPy 이미지들을 Tensor로 변환
-            processed_mosaic_tensors = []
-            for img_modality_np in imgs_mosaic_np: # imgs_mosaic_np는 (lwir_np, vis_np) 튜플
-                img_tensor = img_modality_np.transpose((2, 0, 1))  # HWC to CHW
-                if img_tensor.shape[0] == 3:  # 3채널 이미지의 경우 (BGR -> RGB)
-                    img_tensor = img_tensor[::-1, :, :] 
-                img_tensor = np.ascontiguousarray(img_tensor)
-                processed_mosaic_tensors.append(torch.from_numpy(img_tensor))
-                
-            imgs_to_return = processed_mosaic_tensors # Tensor 리스트
-
-        else: # Not mosaic
+        else:
             # Load image
-            # imgs_modalities_np: [(lwir_np, vis_np)], hw0s_list_of_tuples: [ (h0_lwir, w0_lwir), ...], ...
-            imgs_modalities_np, hw0s_list, hw_resized_list = self.load_image(index) 
-            
-            processed_imgs_tensors = [] # 각 모달리티의 최종 처리된 텐서를 저장할 리스트
-            # non-mosaic 경로에서 최종 레이블 (증강 적용 후, NumPy 형태)
-            labels_processed_final_np = self.labels[index].copy() 
-                                                            
-            M_random_perspective = None # random_perspective 변환 행렬 공유용
+            # hw0s: original shapes, hw1s: resized shapes
+            imgs, hw0s, hw1s = self.load_image(index)
 
-            for ii, (img_np, hw0_tuple, hw_resized_tuple) in enumerate(zip(imgs_modalities_np, hw0s_list, hw_resized_list)):
-                h0, w0 = hw0_tuple       # 원본 높이, 너비
-                # h, w = hw_resized_tuple # 리사이즈된 높이, 너비 (letterbox 이전) -> 이 변수는 현재 사용되지 않음
-
+            for ii, (img, (h0, w0), (h, w)) in enumerate(zip(imgs, hw0s, hw1s)):
                 # Letterbox
-                target_shape_for_letterbox = self.batch_shapes[self.batch[index]] if self.rect else self.img_size
-                img_lb_np, ratio_tuple, pad_tuple = letterbox(img_np.copy(), target_shape_for_letterbox, auto=False, scaleup=self.augment)
-                
-                if ii == 0: # COCO mAP 리스케일링을 위한 shapes 정보는 첫 번째 모달리티 기준으로 한 번만 설정
-                    shapes = (h0, w0), (ratio_tuple, pad_tuple)
+                shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
+                img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+                shapes = (h0, w0), (ratio, pad)  # for COCO mAP rescaling
 
-                # 현재 반복에서의 레이블 (매번 원본에서 복사하여 사용)
-                current_labels_for_modality_np = self.labels[index].copy() # [cls, xc, yc, w, h, occ]
-                
-                # 레이블 좌표 변환: normalized xywh -> pixel xyxy (letterboxed 이미지 기준)
-                # random_perspective 함수는 pixel xyxy 입력을 가정합니다.
-                if current_labels_for_modality_np.size > 0:
-                    # 원본 이미지 크기 (h0, w0) 기준 normalized xywh -> pixel xyxy
-                    # labels_on_letterbox_xyxy: [cls, x1, y1, x2, y2] (occlusion 제외)
-                    # 주의: KAIST 데이터셋은 xywh가 아닌 x_lefttop, y_lefttop, width, height 일 수 있습니다.
-                    # self.labels[index]가 정확히 어떤 포맷인지 확인이 필요합니다. (cls, xc, yc, w, h, occ)로 가정.
-                    
-                    # normalized xc,yc,w,h -> pixel x1,y1,x2,y2 on original image (h0,w0)
-                    temp_labels_xyxy_orig = np.zeros((len(current_labels_for_modality_np), 5))
-                    temp_labels_xyxy_orig[:, 0] = current_labels_for_modality_np[:, 0] # cls
-                    temp_labels_xyxy_orig[:, 1] = (current_labels_for_modality_np[:, 1] - current_labels_for_modality_np[:, 3] / 2) * w0  # x1
-                    temp_labels_xyxy_orig[:, 2] = (current_labels_for_modality_np[:, 2] - current_labels_for_modality_np[:, 4] / 2) * h0  # y1
-                    temp_labels_xyxy_orig[:, 3] = (current_labels_for_modality_np[:, 1] + current_labels_for_modality_np[:, 3] / 2) * w0  # x2
-                    temp_labels_xyxy_orig[:, 4] = (current_labels_for_modality_np[:, 2] + current_labels_for_modality_np[:, 4] / 2) * h0  # y2
+                labels = self.labels[index].copy()
+                if labels.size:  # normalized xywh to pixel xyxy format
+                    labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
+                    labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
-                    # Scale to resized_unpadded dimensions and add padding for letterbox
-                    labels_on_lb_xyxy = temp_labels_xyxy_orig.copy()
-                    labels_on_lb_xyxy[:, [1,3]] = temp_labels_xyxy_orig[:, [1,3]] * ratio_tuple[0] + pad_tuple[0] # x coords
-                    labels_on_lb_xyxy[:, [2,4]] = temp_labels_xyxy_orig[:, [2,4]] * ratio_tuple[1] + pad_tuple[1] # y coords
-
-                    # Clip to letterboxed image dimensions
-                    img_lb_h, img_lb_w = img_lb_np.shape[:2]
-                    labels_on_lb_xyxy[:, [1,3]] = np.clip(labels_on_lb_xyxy[:, [1,3]], 0, img_lb_w)
-                    labels_on_lb_xyxy[:, [2,4]] = np.clip(labels_on_lb_xyxy[:, [2,4]], 0, img_lb_h)
-                    
-                    current_labels_pixel_xyxy = labels_on_lb_xyxy # [cls, x1,y1,x2,y2]
-                else:
-                    current_labels_pixel_xyxy = np.array([])
-
-                # 증강 적용
                 if self.augment:
-                    img_aug_np = img_lb_np.copy() # 증강을 위한 이미지 복사
-                    # labels_aug_xyxy는 증강 후의 [cls, x1,y1,x2,y2] 형태가 됩니다.
-                    labels_aug_xyxy = current_labels_pixel_xyxy.copy() if current_labels_pixel_xyxy.size > 0 else np.array([])
-                    
-                    # segments 처리 (필요시, 여기서는 단순화를 위해 기본값 전달)
-                    current_segments = self.segments[index].copy() if self.segments and self.segments[index] else []
+                    raise NotImplementedError('Please make data augmentation work!')
 
-                    if ii == 0: # 첫 번째 모달리티: random_perspective 변환 행렬 M 생성 및 적용
-                        img_aug_np, labels_aug_xyxy, M_random_perspective = random_perspective(
-                            img_aug_np,
-                            labels_aug_xyxy,
-                            segments_current,
-                            degrees=hyp.get("degrees", 0.0),
-                            translate=hyp.get("translate", 0.0),
-                            scale=hyp.get("scale", 0.0),
-                            shear=hyp.get("shear", 0.0),
-                            perspective=hyp.get("perspective", 0.0)
-                        )
-                    else: # 두 번째 모달리티: 동일한 M 행렬 적용
-                        img_aug_np, _, _ = random_perspective(img_aug_np, M=M_random_perspective)
-                        # 레이블은 첫 번째 모달리티 기준으로 이미 변환됨
+                    img, labels = random_perspective(
+                        img,
+                        labels,
+                        degrees=hyp["degrees"],
+                        translate=hyp["translate"],
+                        scale=hyp["scale"],
+                        shear=hyp["shear"],
+                        perspective=hyp["perspective"],
+                    )
 
-                    # Albumentations (random_perspective 후, pixel xyxy 레이블 사용)
-                    if self.albumentations and labels_aug_xyxy.size > 0:
-                        # Albumentations는 YOLO 포맷(normalized xc,yc,w,h)을 기대하므로 변환 필요
-                        h_img_for_alb, w_img_for_alb = img_aug_np.shape[:2]
-                        labels_for_alb_yolo = np.zeros((len(labels_aug_xyxy), 5))
-                        if len(labels_aug_xyxy) > 0:
-                            labels_for_alb_yolo[:,0] = labels_aug_xyxy[:,0] # class
-                            labels_for_alb_yolo[:,1:] = xyxy2xywhn(labels_aug_xyxy[:,1:5].copy(), w=w_img_for_alb, h=h_img_for_alb, clip=True, eps=1e-3)
+                nl = len(labels)  # number of labels
+                if nl:
+                    labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
 
-                        transformed = self.albumentations(
-                            image=img_aug_np, # cv2.cvtColor(img_aug_np, cv2.COLOR_BGR2RGB) -> Albumentations 클래스 내부에서 처리 가정
-                            bboxes=labels_for_alb_yolo[:, 1:].tolist(), # YOLO format bboxes
-                            class_labels=labels_for_alb_yolo[:, 0].tolist()
-                        )
-                        img_aug_np = transformed['image']
-                        
-                        if ii == 0: # 레이블은 첫 번째 모달리티 기준으로만 업데이트
-                            labels_from_alb_yolo = np.array(transformed['bboxes'])
-                            if labels_from_alb_yolo.size > 0:
-                                # Albumentations가 YOLO 포맷으로 반환한 것을 다시 pixel xyxy로 변환하여 labels_aug_xyxy 업데이트
-                                labels_aug_xyxy[:,1:5] = xywhn2xyxy(labels_from_alb_yolo, w=img_aug_np.shape[1], h=img_aug_np.shape[0])
-                            else:
-                                labels_aug_xyxy = np.array([]) # 모든 박스가 사라진 경우
+                if self.augment:
+                    # Albumentations
+                    img, labels = self.albumentations(img, labels)
+                    nl = len(labels)  # update after albumentations
 
+                    # HSV color-space
+                    augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
 
-                    # HSV (Visible 이미지, 즉 ii == 1 일 때만 적용 가정)
-                    if ii == 1: 
-                        augment_hsv(img_aug_np, hgain=hyp.get("hsv_h",0.0), sgain=hyp.get("hsv_s",0.0), vgain=hyp.get("hsv_v",0.0))
+                    # Flip up-down
+                    if random.random() < hyp["flipud"]:
+                        img = np.flipud(img)
+                        if nl:
+                            labels[:, 2] = 1 - labels[:, 2]
 
-                    # Flip (이미지에 적용 후, 레이블은 ii == 0 일 때만 업데이트)
-                    # labels_aug_xyxy는 pixel xyxy 상태 [cls, x1,y1,x2,y2]
-                    if random.random() < hyp.get("flipud",0.0):
-                        img_aug_np = np.flipud(img_aug_np)
-                        if ii == 0 and labels_aug_xyxy.size > 0:
-                            labels_aug_xyxy[:, [2, 4]] = img_aug_np.shape[0] - labels_aug_xyxy[:, [4, 2]] # y1, y2 좌표 반전
+                    # Flip left-right
+                    if random.random() < hyp["fliplr"]:
+                        img = np.fliplr(img)
+                        if nl:
+                            labels[:, 1] = 1 - labels[:, 1]
 
-                    if random.random() < hyp.get("fliplr",0.0):
-                        img_aug_np = np.fliplr(img_aug_np)
-                        if ii == 0 and labels_aug_xyxy.size > 0:
-                            labels_aug_xyxy[:, [1, 3]] = img_aug_np.shape[1] - labels_aug_xyxy[:, [3, 1]] # x1, x2 좌표 반전
-                    
-                    if ii == 0: # 최종 증강된 레이블(pixel xyxy)을 labels_processed_final_np에 저장
-                        labels_processed_final_np = labels_aug_xyxy
+                    # Cutouts
+                    # labels = cutout(img, labels, p=0.5)
+                    # nl = len(labels)  # update after cutout
 
-                    final_img_for_modality_np = img_aug_np
-                else: # self.augment == False
-                    final_img_for_modality_np = img_lb_np
-                    if ii == 0: # 증강 안 할 시 원본 레이블(pixel xyxy) 사용
-                        labels_processed_final_np = current_labels_pixel_xyxy
+                labels_out = torch.zeros((nl, 7))
+                if nl:
+                    labels_out[:, 1:] = torch.from_numpy(labels)
 
+                # Convert
+                img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+                img = np.ascontiguousarray(img)
 
-                # 이미지 NumPy 배열을 Tensor로 변환
-                img_tensor = final_img_for_modality_np.transpose((2, 0, 1))  # HWC to CHW
-                if img_tensor.shape[0] == 3: # 3채널 이미지 (BGR -> RGB)
-                    img_tensor = img_tensor[::-1, :, :]
-                img_tensor = np.ascontiguousarray(img_tensor)
-                processed_imgs_tensors.append(torch.from_numpy(img_tensor))
-            
-            # non-mosaic 경로의 최종 레이블 처리 (pixel xyxy -> normalized xywh 및 occlusion 추가)
-            nl = len(labels_processed_final_np)
-            labels_out = torch.zeros((nl, 7))  # batch_idx_placeholder, cls, xc, yc, w, h, occ_level
-            if nl:
-                # cls 저장
-                labels_out[:, 1] = torch.from_numpy(labels_processed_final_np[:, 0])
-                # pixel xyxy -> normalized xywh 변환
-                # 마지막으로 사용된 final_img_for_modality_np의 shape 기준으로 정규화 (모든 모달리티가 동일한 최종 shape 가정)
-                h_final_img, w_final_img = final_img_for_modality_np.shape[:2]
-                labels_out[:, 2:6] = torch.from_numpy(xyxy2xywhn(labels_processed_final_np[:, 1:5].copy(), w=w_final_img, h=h_final_img, clip=True, eps=1e-3))
-                
-                # Occlusion level 추가 (원본 레이블에서 가져옴)
-                if self.labels[index].shape[1] == 6 and len(self.labels[index]) == nl: # 원본에 occlusion 정보가 있고 길이가 같다면
-                    labels_out[:, 6] = torch.from_numpy(self.labels[index][:, 5])
-                else: # 없다면 0으로 채움 (또는 다른 기본값)
-                    labels_out[:, 6] = 0
+                imgs[ii] = torch.from_numpy(img)
 
-            imgs_to_return = processed_imgs_tensors
-
-
-        # 공통 로직: labels_out의 마지막 컬럼 (occlusion level) 제거
-        # labels_out은 (N, 7) [batch_idx_placeholder, cls, xc, yc, w, h, occ] 형태를 가집니다.
-        if labels_out.shape[1] == 7:
-             labels_out = labels_out[:, :-1] # 마지막 occlusion level 컬럼 제거 -> (N, 6)
-        elif nl > 0 and labels_out.shape[1] != 6: # nl > 0 인데 컬럼 수가 6이 아니면 경고 (이미 6개면 그대로 둠)
-            LOGGER.warning(f"labels_out has unexpected shape {labels_out.shape} before final processing for index {self.im_files[index]}. Expected 6 or 7 columns.")
-        # 만약 nl == 0 이면 labels_out은 (0,7) 또는 (0,6) 이고, 슬라이싱은 문제 없음.
-
-        return imgs_to_return, labels_out, self.im_files[index], shapes, index
+        # Drop occlusion level
+        labels_out = labels_out[:, :-1]
+        return imgs, labels_out, self.im_files[index], shapes, index
 
     def load_image(self, i):
         """

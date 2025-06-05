@@ -129,8 +129,7 @@ class ComputeLoss:
         self.device = device
 
         self.iou_type = h.get('iou_type', 'CIoU') # Get iou_type from hyperparameters
-        self.wiou_beta = h.get('wiou_beta', 0.25)
-        
+
     def __call__(self, p, targets):  # predictions, targets
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
         lcls = torch.zeros(1, device=self.device)  # class loss
@@ -168,8 +167,6 @@ class ComputeLoss:
                     lbox += (1.0 - iou).mean()  # iou loss
                     iou = iou.detach().clamp(0).type(tobj.dtype) # Use for objectness
 
-                
-
                 # Objectness
                 if self.sort_obj_iou:
                     j = iou.argsort()
@@ -184,7 +181,7 @@ class ComputeLoss:
                 keep = ~ign_idx
                 b_kept, a_kept, gj_kept, gi_kept, iou_kept = b[keep], a[keep], gj[keep], gi[keep], iou[keep]
                 
-                tobj[b_kept, a_kept, gj_kept, gi_kept] = iou_kept.clamp(0, 1)  # iou ratio for kept targets
+                tobj[b_kept, a_kept, gj_kept, gi_kept] = iou_kept  # iou ratio for kept targets
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
@@ -248,7 +245,7 @@ class ComputeLoss:
         for i in range(self.nl):
             anchors, shape = self.anchors[i], p[i].shape
             gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
-            
+
             # Match targets to anchors
             t = targets * gain  # shape(3,n,7)
             if nt:
@@ -281,22 +278,5 @@ class ComputeLoss:
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
-            
-            #print(f"Layer {i}: targets = {tcls[i].shape[0]}, valid = {(tcls[i] != -1).sum()}")
-            
-            
-            if not tcls: # 만약 tcls 리스트가 비어있다면 (아무 레이어에서도 타겟을 못 찾음)
-                print(f"{'='*20} build_targets: NO TARGETS BUILT FOR ANY LAYER {'='*20}")
-                print(f"[WARNING] No targets matched in any layer") 
-            #else:
-            #    for layer_idx in range(self.nl):
-            #        if layer_idx < len(tcls) and tcls[layer_idx] is not None:
-            #            num_targets_in_layer = tcls[layer_idx].shape[0]
-            #            print(f"[DEBUG] build_targets: Layer {layer_idx}, Num targets matched: {num_targets_in_layer}, Anchors selected: {len(anch[layer_idx]) if layer_idx < len(anch) else 'N/A'}")
-            #            if num_targets_in_layer > 0:
-            #                print(f"    Target classes for layer {layer_idx}: {tcls[layer_idx].unique(return_counts=True)}")
-            #        else:
-            #            print(f"[DEBUG] build_targets: Layer {layer_idx}, No targets or tcls data.")
-            # --- 디버깅 코드 끝 ---
 
         return tcls, tbox, indices, anch
