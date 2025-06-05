@@ -39,6 +39,7 @@ from models.yolo import Model
 from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
 from utils.downloads import attempt_download
+from utils.autoanchor import check_anchors
 from utils.general import (
     LOGGER,
     TQDM_BAR_FORMAT,
@@ -197,6 +198,7 @@ def train(hyp, opt, device, callbacks):
         seed=opt.seed,
         rgbt_input=opt.rgbt,
     )
+    check_anchors(dataset, model)
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f"Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}"

@@ -68,7 +68,8 @@ if platform.system() != "Windows":
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from models.experimental import attempt_load
-from models.yolo import ClassificationModel, Detect, DetectionModel, SegmentationModel
+# from models.yolo import ClassificationModel, Detect, DetectionModel, SegmentationModel
+from models.yolo import Detect, DetectionModel 
 from utils.dataloaders import LoadImages
 from utils.general import (
     LOGGER,
@@ -109,6 +110,10 @@ class iOSModel(torch.nn.Module):
         xywh, conf, cls = self.model(x)[0].squeeze().split((4, 1, self.nc), 1)
         return cls * conf, xywh * self.normalize  # confidence (3780, 80), coordinates (3780, 4)
 
+class ClassificationModel: # 더미 클래스
+    pass
+class SegmentationModel: # 더미 클래스
+    pass
 
 def export_formats():
     """Returns a DataFrame of supported YOLOv5 model export formats and their properties."""

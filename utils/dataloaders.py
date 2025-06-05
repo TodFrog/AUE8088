@@ -1222,9 +1222,17 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                 shapes = (h0, w0), (ratio, pad)  # for COCO mAP rescaling
 
                 labels = self.labels[index].copy()
-                if labels.size:  # normalized xywh to pixel xyxy format
-                    labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
-                    labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                # if labels.size:  # normalized xywh to pixel xyxy format
+                #     labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
+                #     labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                if labels.size:
+                    # (x_lefttop, y_lefttop) -> (x_center, y_center)
+                    labels[:, 1] += labels[:, 3] / 2.0  # x_center = x_lefttop + width / 2
+                    labels[:, 2] += labels[:, 4] / 2.0  # y_center = y_lefttop + height / 2
+
+                    # normalized xywh to pixel xyxy format
+                    # labels[:, 1:5] contains xc, yc, w, h (normalized)
+                    labels[:, 1:5] = xywhn2xyxy(labels[:, 1:5], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
                 if self.augment:
                     raise NotImplementedError('Please make data augmentation work!')
@@ -1240,6 +1248,8 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                     )
 
                 nl = len(labels)  # number of labels
+                # if nl:
+                #     labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
                 if nl:
                     labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
 
