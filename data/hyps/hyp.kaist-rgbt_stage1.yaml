@@ -1,36 +1,37 @@
-# data/hyps/hyp.kaist_stage1.yaml
-lr0: 0.01
-lrf: 0.01
+# hyp.kaist_stage1_refine.yaml
+lr0: 0.011          # 약간 상승
+lrf: 0.20           # Cosine 최종 LR 비율 복원
 momentum: 0.937
 weight_decay: 0.0005
 warmup_epochs: 3.0
 warmup_momentum: 0.8
 warmup_bias_lr: 0.1
-iou_type: WIoU     # CIoU 대신 WIoU 사용
-wiou_beta: 0.15    # 필요하면 추가 하이퍼파라미터
-# 손실
+
+# ---------- Loss 가중치 ----------
 box: 0.05
-cls: 0.50
-obj: 1.00
+cls: 0.50           # 배경이 많으므로 ↓
+obj: 1.00           # ↓ 과검출 완화
+fl_gamma: 1.5       # Focal 활성화
 cls_pw: 1.0
 obj_pw: 1.0
-iou_t: 0.20
-anchor_t: 5.0
-fl_gamma: 0.0
+# ---------- IoU ----------
+iou_type: WIoU
+wiou_beta: 2.0
+iou_t: 0.2
+anchor_t: 4.0
 
-# 기하 증강 ― 변경분 only
-scale: 0.00     # ↑ 0.5 → 0.8
-mixup: 0.00     # ↑ 0.0 → 0.10
-
-# 나머지 항목은 scratch-low 기본값 유지
-hsv_h: 0.015
-hsv_s: 0.70
-hsv_v: 0.40
+# ---------- 기하 증강 ----------
 degrees: 0.0
-translate: 0.10
-shear: 0.0
+translate: 0.08
+scale: 0.75
 perspective: 0.0
+mosaic: 0.70        # nano 모델엔 오히려 +   
+mixup: 0.05
+copy_paste: 0.00
+
+# ---------- 색상 (Visible 전용) ----------
+hsv_h: 0.013
+hsv_s: 0.6
+hsv_v: 0.3
 flipud: 0.0
 fliplr: 0.50
-mosaic: 0.00
-copy_paste: 0.0

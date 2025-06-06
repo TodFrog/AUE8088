@@ -46,12 +46,14 @@ class Albumentations:
         except Exception as e:
             LOGGER.info(f"{prefix}{e}")
 
-    def __call__(self, im, labels, p=1.0):
-        """Applies transformations to an image and labels with probability `p`, returning updated image and labels."""
+    def __call__(self, image, bboxes, class_labels, p=1.0):
+        """Applies transformations to an image and labels with probability `p`, returning a dictionary."""
         if self.transform and random.random() < p:
-            new = self.transform(image=im, bboxes=labels[:, 1:], class_labels=labels[:, 0])  # transformed
-            im, labels = new["image"], np.array([[c, *b] for c, b in zip(new["class_labels"], new["bboxes"])])
-        return im, labels
+            # 인자를 그대로 전달하고, albumentations 라이브러리가 반환하는 딕셔너리를 그대로 반환합니다.
+            return self.transform(image=image, bboxes=bboxes, class_labels=class_labels)
+        else:
+            # 변환이 적용되지 않은 경우에도 동일한 딕셔너리 형식으로 반환합니다.
+            return {"image": image, "bboxes": bboxes, "class_labels": class_labels}
 
 
 def normalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD, inplace=False):
@@ -151,8 +153,9 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleF
     return im, ratio, (dw, dh)
 
 
+# ================================= START: 수정된 함수 =================================
 def random_perspective(
-    im, targets=(), segments=(), degrees=10, translate=0.1, scale=0.1, shear=10, perspective=0.0, border=(0, 0)
+    im, targets=(), segments=(), degrees=10, translate=0.1, scale=0.1, shear=10, perspective=0.0, border=(0, 0), M=None
 ):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(0.1, 0.1), scale=(0.9, 1.1), shear=(-10, 10))
     # targets = [cls, xyxy]
@@ -160,47 +163,44 @@ def random_perspective(
     height = im.shape[0] + border[0] * 2  # shape(h,w,c)
     width = im.shape[1] + border[1] * 2
 
-    # Center
-    C = np.eye(3)
-    C[0, 2] = -im.shape[1] / 2  # x translation (pixels)
-    C[1, 2] = -im.shape[0] / 2  # y translation (pixels)
+    # M 인자가 없으면 새로 생성, 있으면 주어진 M 사용
+    if M is None:
+        # Center
+        C = np.eye(3)
+        C[0, 2] = -im.shape[1] / 2  # x translation (pixels)
+        C[1, 2] = -im.shape[0] / 2  # y translation (pixels)
 
-    # Perspective
-    P = np.eye(3)
-    P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
-    P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
+        # Perspective
+        P = np.eye(3)
+        P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
+        P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
 
-    # Rotation and Scale
-    R = np.eye(3)
-    a = random.uniform(-degrees, degrees)
-    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
-    s = random.uniform(1 - scale, 1 + scale)
-    # s = 2 ** random.uniform(-scale, scale)
-    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
+        # Rotation and Scale
+        R = np.eye(3)
+        a = random.uniform(-degrees, degrees)
+        # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
+        s = random.uniform(1 - scale, 1 + scale)
+        # s = 2 ** random.uniform(-scale, scale)
+        R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
 
-    # Shear
-    S = np.eye(3)
-    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
-    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
+        # Shear
+        S = np.eye(3)
+        S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
+        S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
 
-    # Translation
-    T = np.eye(3)
-    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
-    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
+        # Translation
+        T = np.eye(3)
+        T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
+        T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
 
-    # Combined rotation matrix
-    M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
+        # Combined rotation matrix
+        M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
+
     if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
         if perspective:
             im = cv2.warpPerspective(im, M, dsize=(width, height), borderValue=(114, 114, 114))
         else:  # affine
             im = cv2.warpAffine(im, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
-
-    # Visualize
-    # import matplotlib.pyplot as plt
-    # ax = plt.subplots(1, 2, figsize=(12, 6))[1].ravel()
-    # ax[0].imshow(im[:, :, ::-1])  # base
-    # ax[1].imshow(im2[:, :, ::-1])  # warped
 
     # Transform label coordinates
     n = len(targets)
@@ -232,13 +232,22 @@ def random_perspective(
             # clip
             new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
             new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
+        
+        # M을 생성할 때 사용한 s가 없으므로 targets가 비어있지 않으면 s를 다시 계산
+        # 이 부분은 M이 주어질 경우 s(scale) 값을 알 수 없다는 한계가 있으나,
+        # RGBT 데이터셋에서는 라벨 변환을 첫번째 이미지에만 적용하므로 큰 문제가 되지 않음
+        if M is not None and 's' not in locals():
+            s = np.linalg.svd(M[:2, :2])[1].mean()
+
 
         # filter candidates
         i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
         targets = targets[i]
         targets[:, 1:5] = new[i]
-
-    return im, targets
+    
+    # 변환 행렬 M을 추가로 반환
+    return im, targets, M
+# ================================== END: 수정된 함수 ==================================
 
 
 def copy_paste(im, labels, segments, p=0.5):
@@ -298,16 +307,28 @@ def cutout(im, labels, p=0.5):
     return labels
 
 
-def mixup(im, labels, im2, labels2):
+def mixup(imgs1, labels1, imgs2, labels2):
     """
-    Applies MixUp augmentation by blending images and labels.
+    Applies MixUp augmentation for RGBT images by blending image pairs and labels.
+    imgs1: tuple (lwir_img1, vis_img1)
+    imgs2: tuple (lwir_img2, vis_img2)
+    labels1, labels2: numpy arrays of labels
+    """
+    lwir_img1, vis_img1 = imgs1[0], imgs1[1]
+    lwir_img2, vis_img2 = imgs2[0], imgs2[1]
 
-    See https://arxiv.org/pdf/1710.09412.pdf for details.
-    """
     r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
-    im = (im * r + im2 * (1 - r)).astype(np.uint8)
-    labels = np.concatenate((labels, labels2), 0)
-    return im, labels
+
+    # Apply mixup to LWIR images
+    mixed_lwir_img = (lwir_img1 * r + lwir_img2 * (1 - r)).astype(np.uint8)
+
+    # Apply mixup to Visible images
+    mixed_vis_img = (vis_img1 * r + vis_img2 * (1 - r)).astype(np.uint8)
+
+    # Concatenate labels from both image pairs
+    combined_labels = np.concatenate((labels1, labels2), 0)
+
+    return (mixed_lwir_img, mixed_vis_img), combined_labels
 
 
 def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):

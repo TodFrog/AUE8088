@@ -387,7 +387,7 @@ def run(
         try:
             # 생성된 검증용 어노테이션 JSON 파일의 정확한 경로
             # 이 경로는 프로젝트 루트(AUE8088_2) 기준입니다.
-            kaist_annotation_file = 'datasets/kaist-rgbt/KAIST_val_annotation.json' # <--- ⭐ 여기를 수정!
+            kaist_annotation_file = 'utils/eval/KAIST_val-A_annotation.json' # <--- ⭐ 여기를 수정!
 
             if not os.path.exists(kaist_annotation_file):
                 # 에러 메시지에 정확한 파일 경로를 포함하도록 수정
