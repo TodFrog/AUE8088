@@ -1,17 +1,17 @@
 # hyp.kaist_stage1_refine.yaml
-lr0: 0.011          # 약간 상승
-lrf: 0.20           # Cosine 최종 LR 비율 복원
+lr0: 0.005             # 초기 학습률 유지 (안정적인 시작)
+lrf: 0.005             # Cosine 최종 LR 비율 유지
 momentum: 0.937
 weight_decay: 0.0005
-warmup_epochs: 3.0
+warmup_epochs: 2.0     # warmup 기간 유지
 warmup_momentum: 0.8
-warmup_bias_lr: 0.1
+warmup_bias_lr: 0.05   # warmup bias 학습률 유지
 
 # ---------- Loss 가중치 ----------
 box: 0.05
-cls: 0.50           # 배경이 많으므로 ↓
-obj: 1.00           # ↓ 과검출 완화
-fl_gamma: 1.5       # Focal 활성화
+cls: 0.30              # 배경이 많음을 고려하여 추가 감소
+obj: 0.70              # 현재 recall이 낮으므로 탐지 능력 개선에 초점
+fl_gamma: 0.0          # Focal Loss 비활성화 유지 (기본 CrossEntropy에 가깝게)
 cls_pw: 1.0
 obj_pw: 1.0
 # ---------- IoU ----------
@@ -21,17 +21,18 @@ iou_t: 0.2
 anchor_t: 4.0
 
 # ---------- 기하 증강 ----------
-degrees: 0.0
-translate: 0.08
-scale: 0.75
-perspective: 0.0
-mosaic: 0.70        # nano 모델엔 오히려 +   
-mixup: 0.05
+degrees: 0.0           # 회전 증강 비활성화 유지
+translate: 0.01        # 이동 증강 강도 매우 낮춤
+scale: 0.05            # 스케일 증강 강도 매우 낮춤 (0.95~1.05 범위)
+shear: 0.0             # 전단 증강 비활성화 유지
+perspective: 0.0       # 원근 증강 비활성화 유지
+mosaic: 0.10           # Mosaic 증강 아주 약간 적용
+mixup: 0.05            # Mixup 증강 아주 약간 적용
 copy_paste: 0.00
 
 # ---------- 색상 (Visible 전용) ----------
-hsv_h: 0.013
-hsv_s: 0.6
-hsv_v: 0.3
+hsv_h: 0.0005          # 색조 증강 강도 더욱 최소화
+hsv_s: 0.05            # 채도 증강 강도 더욱 최소화
+hsv_v: 0.02            # 명도 증강 강도 더욱 최소화
 flipud: 0.0
 fliplr: 0.50

@@ -19,6 +19,7 @@ import time
 import torch
 import torch.nn as nn
 import yaml
+import wandb
 
 from copy import deepcopy
 from datetime import datetime
@@ -471,17 +472,44 @@ def parse_opt(known=False):
 
 
 def main(opt, callbacks=Callbacks()):
-    """Runs training or hyperparameter evolution with specified options and optional callbacks."""
+    # 기존 코드 유지
     print_args(vars(opt))
     check_requirements(ROOT / "requirements.txt")
+    opt.weights = str(opt.weights)
+    opt.project = str(Path(opt.project).name)
+    wandb.init(project=opt.project, entity=opt.entity, name=opt.name)
 
-    opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = (
-        check_file(opt.data),
-        check_yaml(opt.cfg),
-        check_yaml(opt.hyp),
-        str(opt.weights),
-        str(opt.project),
-    )  # checks
+
+    for k, v in wandb.config.items():
+        if k == "hyp":
+            # hyp는 중첩된 딕셔너리이므로 별도로 처리
+            # hyp.kaist-rgbt_stage1.yaml의 기본값을 먼저 로드한 다음,
+            # sweep에서 제안하는 hyp 값을 덮어씌웁니다.
+            if isinstance(v, dict): # hyp가 딕셔너리인 경우
+                # 기존 hyp를 로드하고, sweep에서 넘어온 값으로 업데이트
+                if opt.hyp and Path(opt.hyp).is_file(): # 기존 hyp 파일이 있다면 로드
+                    with open(opt.hyp, errors="ignore") as f:
+                        base_hyp = yaml.safe_load(f)
+                else:
+                    base_hyp = {} # 없으면 빈 딕셔너리
+                base_hyp.update(v) # sweep에서 넘어온 값으로 업데이트
+                opt.hyp = base_hyp
+            else: # hyp가 파일 경로 문자열인 경우 (sweep에서 hyp 블록이 없는 경우)
+                opt.hyp = check_yaml(v) # 기존 동작 유지
+        elif hasattr(opt, k):
+            # wandb.config의 값이 문자열 "true"/"false"로 넘어오는 경우 bool로 변환
+            if isinstance(v, str) and v.lower() == "true":
+                setattr(opt, k, True)
+            elif isinstance(v, str) and v.lower() == "false":
+                setattr(opt, k, False)
+            else:
+                setattr(opt, k, v)
+    
+    # 여기서 다시 한번 파일 유무를 체크합니다.
+    opt.data = check_file(opt.data)
+    opt.cfg = check_yaml(opt.cfg)
+    # opt.hyp는 이미 딕셔너리가 되었으므로 check_yaml을 호출하지 않습니다.
+
     assert len(opt.cfg) or len(opt.weights), "either --cfg or --weights must be specified"
     if opt.name == "cfg":
         opt.name = Path(opt.cfg).stem  # use model.yaml as name
