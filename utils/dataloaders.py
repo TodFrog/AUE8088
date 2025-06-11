@@ -1510,30 +1510,21 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                 # 레이블 좌표 변환: normalized xywh -> pixel xyxy (letterboxed 이미지 기준)
                 # random_perspective 함수는 pixel xyxy 입력을 가정합니다.
                 if current_labels_for_modality_np.size > 0:
-                    # 원본 이미지 크기 (h0, w0) 기준 normalized xywh -> pixel xyxy
-                    # labels_on_letterbox_xyxy: [cls, x1, y1, x2, y2] (occlusion 제외)
-                    # 주의: KAIST 데이터셋은 xywh가 아닌 x_lefttop, y_lefttop, width, height 일 수 있습니다.
-                    # self.labels[index]가 정확히 어떤 포맷인지 확인이 필요합니다. (cls, xc, yc, w, h, occ)로 가정.
-                    
-                    # normalized xc,yc,w,h -> pixel x1,y1,x2,y2 on original image (h0,w0)
-                    temp_labels_xyxy_orig = np.zeros((len(current_labels_for_modality_np), 5))
-                    temp_labels_xyxy_orig[:, 0] = current_labels_for_modality_np[:, 0] # cls
-                    temp_labels_xyxy_orig[:, 1] = (current_labels_for_modality_np[:, 1] - current_labels_for_modality_np[:, 3] / 2) * w0  # x1
-                    temp_labels_xyxy_orig[:, 2] = (current_labels_for_modality_np[:, 2] - current_labels_for_modality_np[:, 4] / 2) * h0  # y1
-                    temp_labels_xyxy_orig[:, 3] = (current_labels_for_modality_np[:, 1] + current_labels_for_modality_np[:, 3] / 2) * w0  # x2
-                    temp_labels_xyxy_orig[:, 4] = (current_labels_for_modality_np[:, 2] + current_labels_for_modality_np[:, 4] / 2) * h0  # y2
+                    # normalized [x_topleft, y_topleft, w, h] -> pixel [x1, y1, x2, y2]
+                    # 이전의 잘못된 변환 코드를 아래 코드로 교체해야 합니다.
+                    labels_on_orig_xyxy = np.zeros_like(current_labels_for_modality_np[:, :5]) # [cls, x1, y1, x2, y2]
+                    labels_on_orig_xyxy[:, 0] = current_labels_for_modality_np[:, 0] # cls
+                    labels_on_orig_xyxy[:, 1] = current_labels_for_modality_np[:, 1] * w0  # x1 = x_tl * w0
+                    labels_on_orig_xyxy[:, 2] = current_labels_for_modality_np[:, 2] * h0  # y1 = y_tl * h0
+                    labels_on_orig_xyxy[:, 3] = (current_labels_for_modality_np[:, 1] + current_labels_for_modality_np[:, 3]) * w0  # x2 = (x_tl + w) * w0
+                    labels_on_orig_xyxy[:, 4] = (current_labels_for_modality_np[:, 2] + current_labels_for_modality_np[:, 4]) * h0  # y2 = (y_tl + h) * h0
 
-                    # Scale to resized_unpadded dimensions and add padding for letterbox
-                    labels_on_lb_xyxy = temp_labels_xyxy_orig.copy()
-                    labels_on_lb_xyxy[:, [1,3]] = temp_labels_xyxy_orig[:, [1,3]] * ratio_tuple[0] + pad_tuple[0] # x coords
-                    labels_on_lb_xyxy[:, [2,4]] = temp_labels_xyxy_orig[:, [2,4]] * ratio_tuple[1] + pad_tuple[1] # y coords
+                    # letterbox 스케일링 및 패딩 적용
+                    labels_on_lb_xyxy = labels_on_orig_xyxy.copy()
+                    labels_on_lb_xyxy[:, [1,3]] = labels_on_orig_xyxy[:, [1,3]] * ratio_tuple[0] + pad_tuple[0] # x coords
+                    labels_on_lb_xyxy[:, [2,4]] = labels_on_orig_xyxy[:, [2,4]] * ratio_tuple[1] + pad_tuple[1] # y coords
 
-                    # Clip to letterboxed image dimensions
-                    img_lb_h, img_lb_w = img_lb_np.shape[:2]
-                    labels_on_lb_xyxy[:, [1,3]] = np.clip(labels_on_lb_xyxy[:, [1,3]], 0, img_lb_w)
-                    labels_on_lb_xyxy[:, [2,4]] = np.clip(labels_on_lb_xyxy[:, [2,4]], 0, img_lb_h)
-                    
-                    current_labels_pixel_xyxy = labels_on_lb_xyxy # [cls, x1,y1,x2,y2]
+                    current_labels_pixel_xyxy = labels_on_lb_xyxy
                 else:
                     current_labels_pixel_xyxy = np.array([])
 

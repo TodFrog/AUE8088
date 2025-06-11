@@ -350,6 +350,8 @@ def train(hyp, opt, device, callbacks):
                 callbacks=callbacks,
                 compute_loss=compute_loss,
                 epoch=epoch,
+                task='val',  # <--- ✅ 이 인자를 추가해야 합니다!
+                rgbt=opt.rgbt 
             )
 
         # Update best mAP

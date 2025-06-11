@@ -79,7 +79,7 @@ def save_one_json(predn, jdict, path, index, class_map):
     box = xyxy2xywh(predn[:, :4])  # xywh
     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
     for p, b in zip(predn.tolist(), box.tolist()):
-        if p[4] < 0.01:
+        if p[4] < 0.1:
             continue
         jdict.append(
             {
@@ -191,51 +191,58 @@ def run(
 
     # Dataloader
     if not training:
-        if pt and not single_cls:  # check --weights are trained on --data
-            ncm = model.model.nc
-            assert ncm == nc, (
-                f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
-                f"classes). Pass correct combination of --weights and --data that are trained together."
-            )
-        # model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
-        # val.py의 run 함수 내부, model.warmup 호출 부분 수정
-        # (training=False 블록 안에 있음)
-        if opt.rgbt: # opt.rgbt가 True이고, pt 모델일 경우 (엔진 등 다른 백엔드는 별도 고려 필요)
-            # RGBT 모델을 위한 더미 입력 (리스트 형태)
-            dummy_input_list = [
-                torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=model.device),
-                torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=model.device)
-            ]
-            if half: # 또는 model.fp16
-                dummy_input_list = [d.half() for d in dummy_input_list]
-            # DetectMultiBackend의 PyTorch 모델에 직접 forward 호출하여 warmup
-            if pt: # PyTorch 모델인 경우
-                model.model(dummy_input_list) # model.model이 실제 PyTorch 모델임
-            else: # 다른 백엔드의 경우 warmup 방식 확인 필요 (일단 기존 방식 유지 또는 에러 발생 가능성)
-                model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))
-        else:
-            model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))
-        pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
-        if task == "speed":
-            pad, rect = 0.0, False
-        elif rgbt: # RGBT 모드이고, task가 val 또는 test인 경우 (KAIST 평가 때문)
-            pad, rect = 0.5, False # RGBT를 위한 KAIST 평가 시 rect는 항상 False
-        else: # 일반적인 val 또는 test
-            pad, rect = 0.5, pt # PyTorch 모델이면 True, 아니면 False (기존 로직 유지)
-        task_to_load = task if task in ("train", "val", "test") else "val"  # data 키 접근 전 task 이름 확정
-        dataloader = create_dataloader(
-            data[task_to_load],
-            imgsz,
-            batch_size,
-            stride,
-            single_cls,
-            pad=pad,
-            rect=rect,
-            workers=0,
-            prefix=colorstr(f"{task_to_load}: "),
-            rgbt_input=rgbt  # <<< 이 부분을 추가해야 합니다 (opt.rgbt는 parse_opt에서 추가된 값)
+            if pt and not single_cls:  # check --weights are trained on --data
+                ncm = model.model.nc
+                assert ncm == nc, (
+                    f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
+                    f"classes). Pass correct combination of --weights and --data that are trained together."
+                )
+            
+            # --- [수정된 Warmup 블록 시작] ---
+            if rgbt:
+                LOGGER.info('RGBT model warmup...')
+                # RGBT 모델은 [RGB, Thermal] 두 개의 입력을 리스트로 받습니다.
+                dummy_input_list = [
+                    torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=model.device),
+                    torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=model.device)
+                ]
+                if half: # half precision 적용
+                    dummy_input_list = [d.half() for d in dummy_input_list]
+                
+                # pt 모델인 경우, model.model을 직접 호출하여 warmup을 수행합니다.
+                # model.warmup() 함수를 사용하지 않고 우회합니다.
+                if pt:
+                    model.model(dummy_input_list)
+                else:
+                    # pt가 아닌 다른 백엔드(ONNX, TensorRT 등)의 RGBT 모델은
+                    # 별도의 warmup 방식이 필요할 수 있으나, 현재는 pt에 집중합니다.
+                    # 이 부분은 에러가 날 수 있으나, 우리는 pt 모델만 사용하므로 문제가 없습니다.
+                    model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))
 
-        )[0]
+            else:  # 일반 모델인 경우 (기존 동작 유지)
+                model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))
+
+            # pad, rect 설정 로직 (이 부분은 이전과 동일하게 유지하거나, 아래처럼 명확하게 정리할 수 있습니다)
+            if task == "speed":
+                pad, rect = 0.0, False
+            elif rgbt: # RGBT 모드이고, task가 val 또는 test인 경우 (KAIST 평가 때문)
+                pad, rect = 0.5, False # RGBT를 위한 KAIST 평가 시 rect는 항상 False
+            else: # 일반적인 val 또는 test
+                pad, rect = 0.5, pt
+                
+            task_to_load = task if task in ("train", "val", "test") else "val"  # data 키 접근 전 task 이름 확정
+            dataloader = create_dataloader(
+                data[task_to_load],
+                imgsz,
+                batch_size,
+                stride,
+                single_cls,
+                pad=pad,
+                rect=rect,
+                workers=workers,
+                prefix=colorstr(f"{task_to_load}: "),
+                rgbt_input=rgbt
+            )[0]
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
@@ -305,18 +312,34 @@ def run(
             # Predictions
             if single_cls:
                 pred[:, 5] = 0
-            predn = pred.clone()
-            scale_boxes(ims[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
-
+            
+            # ✅ 핵심: 예측 박스를 원본 좌표계로 스케일링하는 predn 로직을 사용하지 않고,
+            # ✅ 모델에서 나온 pred를 그대로 사용합니다. (리사이즈된 이미지 좌표계 기준)
+            
             # Evaluate
             if nl:
+                # ✅ 정답 박스(labels)를 예측 박스와 동일한 '리사이즈된 이미지' 좌표계로 변환합니다.
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-                scale_boxes(ims[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct = process_batch(predn, labelsn, iouv)
+                correct = process_batch(pred, labelsn, iouv) # ✅ predn 대신 pred 사용
                 if plots:
-                    confusion_matrix.process_batch(predn, labelsn)
+                    # confusion_matrix를 위한 predn 생성 (원본 좌표계)
+                    predn_for_cm = pred.clone()
+                    scale_boxes(ims[si].shape[1:], predn_for_cm[:, :4], shape, shapes[si][1])
+                    confusion_matrix.process_batch(predn_for_cm, labelsn)
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
+
+            # Save/log
+            if save_txt or save_json: # JSON 저장을 위해 predn이 필요하므로 여기서 한 번만 계산
+                predn = pred.clone()
+                scale_boxes(ims[si].shape[1:], predn[:, :4], shape, shapes[si][1])
+
+            if save_txt:
+                (save_dir / "labels").mkdir(parents=True, exist_ok=True)
+                save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
+            if save_json:
+                save_one_json(predn, jdict, path, index, class_map)  # append to COCO-JSON dictionary
+            callbacks.run("on_val_image_end", pred, pred.clone(), path, names, ims[si])
 
             # Save/log
             if save_txt:
@@ -384,23 +407,30 @@ def run(
         LOGGER.info(f"\nEvaluating mAP...")
 
         # Run evaluation: KAIST Multispectral Pedestrian Dataset
-        try:
-            # 생성된 검증용 어노테이션 JSON 파일의 정확한 경로
-            # 이 경로는 프로젝트 루트(AUE8088_2) 기준입니다.
-            kaist_annotation_file = 'utils/eval/KAIST_val-A_annotation.json' # <--- ⭐ 여기를 수정!
+        if task != 'test':
+            LOGGER.info(f"\nRunning KAIST Evaluation for task '{task}'...")
+            try:
+                # task에 따라 올바른 정답 파일을 선택
+                if task == 'val':
+                    kaist_annotation_file = 'utils/eval/KAIST_val-A_annotation.json'
+                else:
+                    # 'val' 이외의 task는 기본적으로 validation annotation을 사용 (필요시 수정)
+                    kaist_annotation_file = 'utils/eval/KAIST_val-A_annotation.json'
 
-            if not os.path.exists(kaist_annotation_file):
-                # 에러 메시지에 정확한 파일 경로를 포함하도록 수정
-                raise FileNotFoundError(f"KAIST validation annotation file not found at '{kaist_annotation_file}'. "
-                                        f"Please generate it using utils/eval/generate_kaist_ann_json.py")
-            
-            # python3 대신 현재 환경의 python 사용 (또는 그냥 python)
-            # 명령어 문자열을 만들 때 f-string 사용 권장
-            eval_command = f"python utils/eval/kaisteval.py --annFile {kaist_annotation_file} --rstFile {pred_json}"
-            LOGGER.info(f"Running KAIST evaluation: {eval_command}")
-            os.system(eval_command) # subprocess.run 권장
-        except Exception as e:
-            LOGGER.info(f"kaisteval unable to run: {e}")
+                if not os.path.exists(kaist_annotation_file):
+                    raise FileNotFoundError(f"Annotation file not found for task '{task}' at '{kaist_annotation_file}'.")
+
+                # Plotting을 위한 --evalFig 인자 추가
+                figure_filename = str(save_dir / f"{w}_miss_rate_plot.jpg")
+                eval_command = (f"python utils/eval/kaisteval.py "
+                                f"--annFile {kaist_annotation_file} "
+                                f"--rstFile {pred_json} "
+                                f"--evalFig {figure_filename}")
+                LOGGER.info(f"Running command: {eval_command}")
+                os.system(eval_command)
+
+            except Exception as e:
+                LOGGER.info(f"kaisteval unable to run: {e}")
 
     # Return results
     model.float()  # for training

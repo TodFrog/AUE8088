@@ -1,48 +1,37 @@
-# data/hyps/hyp.kaist-rgbt_stage3.yaml
-# Stage 2 기반으로 값들을 점진적으로 증가시키거나 새로운 증강 추가
-
-lr0: 0.01
-lrf: 0.01
+# hyp.kaist_stage3_refine.yaml
+lr0: 0.00005             # 학습률을 더 낮춤 (매우 정밀한 미세 조정)
+lrf: 0.000005            # 최종 학습률을 더 낮춤
 momentum: 0.937
 weight_decay: 0.0005
 warmup_epochs: 3.0
 warmup_momentum: 0.8
 warmup_bias_lr: 0.1
 
-# 손실
+# ---------- Loss 가중치 ----------
 box: 0.05
-cls: 0.50
-obj: 1.00
+cls: 0.50                # cls 가중치 유지
+obj: 1.00                # obj 가중치 유지
+fl_gamma: 0.0
 cls_pw: 1.0
 obj_pw: 1.0
-iou_t: 0.20
+# ---------- IoU ----------
+iou_type: WIoU
+wiou_beta: 2.0
+iou_t: 0.2
 anchor_t: 4.0
-fl_gamma: 0.0
 
-# --- 데이터 증강 파라미터 ---
-# Stage 2 보다 강도를 높이거나 새로운 값 추가
-hsv_h: 0.018      # ↑ Stage 2: 0.015
-hsv_s: 0.75       # ↑ Stage 2: 0.70
-hsv_v: 0.45       # ↑ Stage 2: 0.40
-degrees: 5.0      # ↑ Stage 2: 0.0 (회전 증강 추가)
-translate: 0.12   # ↑ Stage 2: 0.10
-scale: 0.85       # ↑ Stage 2: 0.80 (기존 scale에서 약간 더)
-shear: 2.0        # ↑ Stage 2: 0.0 (전단 증강 추가)
-perspective: 0.0  # 투시 변환은 신중하게 (일단 유지)
-flipud: 0.1       # ↑ Stage 2: 0.0 (상하 뒤집기 확률 약간 추가)
-fliplr: 0.5       # 좌우 뒤집기는 일반적으로 유용 (유지 또는 약간 증가)
-mosaic: 0.0       # ↓ Stage 2: 1.0 (RGBT에서 Mosaic 구현이 복잡하면 우선 비활성화 또는 낮은 확률로 시작)
-                  # 만약 RGBT Mosaic을 구현했다면 1.0 또는 적절한 확률
-mixup: 0.15       # ↑ Stage 2: 0.10 (MixUp 강도 증가)
-copy_paste: 0.0   # Copy-Paste도 구현 복잡도 고려 (우선 비활성화)
+# ---------- 기하 증강 ----------
+degrees: 0.0             # 회전 증강 비활성화 유지
+translate: 0.05          # 이동 증강 강도 유지
+scale: 0.15              # 스케일 증강 강도 유지
+shear: 0.0               # 전단 증강 비활성화 유지
+perspective: 0.0         # 원근 증강 비활성화 유지
+mosaic: 1.0              # Mosaic 증강 강도 최대로 활성화
+mixup: 0.1               # Mixup 증강 강도 활성화 (기존 0.05에서 약간 높임)
 
-# Albumentations 관련 (RGB 이미지 대상)
-# hyp 파일에 직접 확률값을 넣거나, Albumentations 클래스 생성 시 고정값 사용 가능
-# 예시: rgb_blur_p: 0.1, rgb_clahe_p: 0.1 등으로 확률 제어 가능하도록 수정 고려
-# 현재 augmentations.py의 Albumentations는 hyp에서 p_blur, p_clahe를 가져옴
-rgb_blur: 0.1     # 블러 적용 확률 (0.0 ~ 1.0)
-rgb_clahe: 0.1    # CLAHE 적용 확률 (0.0 ~ 1.0)
-
-# (선택적) Thermal 이미지용 Albumentations 파라미터 (코_드 수정 필요)
-# thermal_brightness_contrast_p: 0.1
-# thermal_gaussian_noise_p: 0.05
+# ---------- 색상 (Visible 전용) ----------
+hsv_h: 0.01
+hsv_s: 0.07
+hsv_v: 0.05
+flipud: 0.0
+fliplr: 0.50
