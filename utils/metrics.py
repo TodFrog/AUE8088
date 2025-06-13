@@ -230,10 +230,10 @@ class ConfusionMatrix:
             print(" ".join(map(str, self.matrix[i])))
 
 
-def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, WIoU=False ,beta=0.25, eps=1e-7):
+def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
     """
-    Calculates IoU, GIoU, DIoU, CIoU, or WIoU between two boxes, supporting xywh/xyxy formats.
-    Returns the IoU value or the specific IoU loss (e.g., WIoU loss).
+    Calculates IoU, GIoU, DIoU, or CIoU between two boxes, supporting xywh/xyxy formats.
+
     Input shapes are box1(1,4) to box2(n,4).
     """
 
@@ -259,76 +259,21 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, WIoU=Fal
 
     # IoU
     iou = inter / union
-    
-    # Calculate different IoU types
-    if GIoU:
+    if CIoU or DIoU or GIoU:
         cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
         ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
-        c_area = cw * ch + eps  # convex area
-        return iou - (c_area - union) / c_area  # GIoU
-    elif DIoU or CIoU or WIoU:
-        # Center point distance squared
-        c_x = (b1_x1 + b1_x2) / 2 - (b2_x1 + b2_x2) / 2
-        c_y = (b1_y1 + b1_y2) / 2 - (b2_y1 + b2_y2) / 2
-        rho2 = c_x**2 + c_y**2
-
-        # Minimum enclosing box diagonal squared
-        cw_enclosing = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)
-        ch_enclosing = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)
-        c2 = cw_enclosing**2 + ch_enclosing**2 + eps # convex diagonal squared
-
-        if DIoU:
+        if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
+            c2 = cw**2 + ch**2 + eps  # convex diagonal squared
+            rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center dist ** 2
+            if CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
+                v = (4 / math.pi**2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
+                with torch.no_grad():
+                    alpha = v / (v - iou + (1 + eps))
+                return iou - (rho2 / c2 + v * alpha)  # CIoU
             return iou - rho2 / c2  # DIoU
-        elif CIoU:
-            v = (4 / math.pi**2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
-            with torch.no_grad():
-                alpha = v / (v - iou + (1 + eps))
-            return iou - (rho2 / c2 + v * alpha)  # CIoU
-        elif WIoU:
-            # ---------------- WIoU-v3 loss ----------------
-            # 기본 IoU loss
-            #iou_loss = 1.0 - iou                 # L_IoU
-
-            # 중심 거리 항 (DIoU/CIoU와 동일한 정의)
-            #dist_ratio = rho2 / c2               # 0 ~ 1
-
-            # 하이퍼파라미터(β):  yaml > `wiou_beta` (기본 2.0)
-            #beta = 2.0
-
-            # WIoU v3 포커싱 팩터 R_WIoU  ≈ exp(dist_ratio^β)
-            #weight = torch.exp(dist_ratio ** beta)
-
-            #wiou_loss = iou_loss * weight        # L_WIoU
-            #return wiou_loss                     # ←  ComputeLoss에서 바로 mean() 해줌
-            
-            
-            # ---------- WIoU-v3 ----------
-            #   · IoU 자체는 그대로 두고
-            #   · 중심 거리 항과 종횡비 차이를 가중치로 사용해 "wise" 가중 IoU 점수를 만듦
-            #   · wiou_score ∈ [0, 1]  →  Loss = 1 - wiou_score
-
-            # ① 중심 거리 가중치
-            #    outlier_degree_c ∈ [0, 1]  (멀수록 0에 가까워짐)
-            outlier_degree_c = torch.exp(-4 * rho2 / (c2 + eps))          # 논문 β₁=4
-
-            # ② 종횡비 가중치
-            ar_gt   = w2 / (h2 + eps)
-            ar_pred = w1 / (h1 + eps)
-            ar_diff = torch.abs(torch.atan(ar_gt) - torch.atan(ar_pred))  # 각도 차
-            outlier_degree_ar = torch.exp(-2 * ar_diff)                   # 논문 β₂=2
-
-            # ③ IoU 손실(base)  = 1 - IoU
-            iou_loss_base = 1.0 - iou
-
-            # ④ Wise 가중치 r  (비선형 포커싱, 논문 β=0.25 기본)
-            r = (iou_loss_base + eps).pow(beta)       # β = 0.25 (default)
-
-            # ⑤ 최종 WIoU 점수
-            wiou_score = iou * outlier_degree_c * outlier_degree_ar
-            wiou_loss  = 1.0 - wiou_score
-            return wiou_loss * r                     # → ‘Loss’를 직접 돌려줌
-
-    return iou  # IoU (default, or if no specific type is requested)
+        c_area = cw * ch + eps  # convex area
+        return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf
+    return iou  # IoU
 
 
 def box_iou(box1, box2, eps=1e-7):

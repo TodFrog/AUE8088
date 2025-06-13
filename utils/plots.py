@@ -171,7 +171,7 @@ def plot_images(images, targets, paths=None, fname="images.jpg", names=None):
             break
         x, y = int(w * (i // ns)), int(h * (i % ns))  # block origin
         im = im.transpose(1, 2, 0)
-        mosaic[y : y + h, x : x + w, :] = im[:, :, :3]
+        mosaic[y : y + h, x : x + w, :] = im
 
     # Resize (optional)
     scale = max_size / ns / max(h, w)
@@ -204,16 +204,6 @@ def plot_images(images, targets, paths=None, fname="images.jpg", names=None):
             boxes[[0, 2]] += x
             boxes[[1, 3]] += y
             for j, box in enumerate(boxes.T.tolist()):
-                # PIL-ImageDraw 는 x2>x1, y2>y1 인 사각형만 허용
-                x1, y1, x2, y2 = box
-                if x1 > x2:          # 좌우 뒤집힘 교정
-                    x1, x2 = x2, x1
-                if y1 > y2:          # 상하 뒤집힘 교정
-                    y1, y2 = y2, y1
-                if (x2 - x1) * (y2 - y1) <= 0:   # 0-면적 → 건너뛰기
-                    continue
-                box = [x1, y1, x2, y2]
-                
                 cls = classes[j]
                 color = colors(cls)
                 cls = names[cls] if names and cls in names else cls

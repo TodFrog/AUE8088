@@ -19,7 +19,6 @@ import time
 import torch
 import torch.nn as nn
 import yaml
-import wandb
 
 from copy import deepcopy
 from datetime import datetime
@@ -40,7 +39,6 @@ from models.yolo import Model
 from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
 from utils.downloads import attempt_download
-from utils.autoanchor import check_anchors
 from utils.general import (
     LOGGER,
     TQDM_BAR_FORMAT,
@@ -156,20 +154,6 @@ def train(hyp, opt, device, callbacks):
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
 
-    # [START MODIFICATION] Freeze layers functionality added here
-    if len(opt.freeze):
-        freeze_layers = [f'model.{x}.' for x in opt.freeze] # Convert indices to module names
-        for k, v in model.named_parameters():
-            if any(x in k for x in freeze_layers):
-                LOGGER.info(f'freezing {k}')
-                v.requires_grad = False
-    
-    # Log trainable parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    LOGGER.info(f"{trainable_params} trainable parameters out of {total_params} total parameters.")
-    # [END MODIFICATION]
-
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
@@ -201,7 +185,7 @@ def train(hyp, opt, device, callbacks):
         gs,
         single_cls,
         hyp=hyp,
-        augment=True,      # TODO: make it work
+        augment=False,      # TODO: make it work
         cache=None if opt.cache == "val" else opt.cache,
         rect=opt.rect,
         rank=-1,
@@ -213,7 +197,6 @@ def train(hyp, opt, device, callbacks):
         seed=opt.seed,
         rgbt_input=opt.rgbt,
     )
-    check_anchors(dataset, model)
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f"Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}"
@@ -286,18 +269,11 @@ def train(hyp, opt, device, callbacks):
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
 
-            if isinstance(imgs, (tuple, list)):  # RGBT
-                rgb, thermal = imgs
-                # print(f"[DEBUG] RGB shape: {rgb.shape}, Thermal shape: {thermal.shape}")
-                rgb = rgb.to(device, non_blocking=True).float() / 255
-                thermal = thermal.to(device, non_blocking=True).float() / 255
-                imgs = torch.cat([rgb, thermal], dim=1)  # (B, 6, H, W)
+            if isinstance(imgs, list):
+                imgs = [img.to(device, non_blocking=True).float() / 255 for img in imgs]    # For RGB-T input
             else:
-                print(f"[DEBUG] Single stream image shape: {imgs.shape}")
-                imgs = imgs.to(device, non_blocking=True).float() / 255
-                
-            targets = targets.to(device) # GPU
-            
+                imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -309,12 +285,12 @@ def train(hyp, opt, device, callbacks):
                         x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
 
             # Forward
-            imgs_rgb = imgs[:, :3, :, :]
-            imgs_thermal = imgs[:, 3:, :, :]
-            pred = model([imgs_rgb, imgs_thermal])  # List로 전달해야 MultiStreamConv에서 정상 작동
+            with torch.amp.autocast(device_type=device.type):
+                pred = model(imgs)  # forward
+                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                if opt.quad:
+                    loss *= 4.0
 
-            # loss
-            loss, loss_items = compute_loss(pred, targets)
             # Backward
             scaler.scale(loss).backward()
 
@@ -364,8 +340,6 @@ def train(hyp, opt, device, callbacks):
                 callbacks=callbacks,
                 compute_loss=compute_loss,
                 epoch=epoch,
-                task='val',  # <--- ✅ 이 인자를 추가해야 합니다!
-                rgbt=opt.rgbt 
             )
 
         # Update best mAP
@@ -472,7 +446,7 @@ def parse_opt(known=False):
     parser.add_argument("--cos-lr", action="store_true", help="cosine LR scheduler")
     parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon")
     parser.add_argument("--patience", type=int, default=100, help="EarlyStopping patience (epochs without improvement)")
-    parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: 0=backbone, 1=first conv, 2=C3, etc.")
+    # parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
     parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
@@ -488,44 +462,17 @@ def parse_opt(known=False):
 
 
 def main(opt, callbacks=Callbacks()):
-    # 기존 코드 유지
+    """Runs training or hyperparameter evolution with specified options and optional callbacks."""
     print_args(vars(opt))
     check_requirements(ROOT / "requirements.txt")
-    opt.weights = str(opt.weights)
-    opt.project = str(Path(opt.project).name)
-    wandb.init(project=opt.project, entity=opt.entity, name=opt.name)
 
-
-    for k, v in wandb.config.items():
-        if k == "hyp":
-            # hyp는 중첩된 딕셔너리이므로 별도로 처리
-            # hyp.kaist-rgbt_stage1.yaml의 기본값을 먼저 로드한 다음,
-            # sweep에서 제안하는 hyp 값을 덮어씌웁니다.
-            if isinstance(v, dict): # hyp가 딕셔너리인 경우
-                # 기존 hyp를 로드하고, sweep에서 넘어온 값으로 업데이트
-                if opt.hyp and Path(opt.hyp).is_file(): # 기존 hyp 파일이 있다면 로드
-                    with open(opt.hyp, errors="ignore") as f:
-                        base_hyp = yaml.safe_load(f)
-                else:
-                    base_hyp = {} # 없으면 빈 딕셔너리
-                base_hyp.update(v) # sweep에서 넘어온 값으로 업데이트
-                opt.hyp = base_hyp
-            else: # hyp가 파일 경로 문자열인 경우 (sweep에서 hyp 블록이 없는 경우)
-                opt.hyp = check_yaml(v) # 기존 동작 유지
-        elif hasattr(opt, k):
-            # wandb.config의 값이 문자열 "true"/"false"로 넘어오는 경우 bool로 변환
-            if isinstance(v, str) and v.lower() == "true":
-                setattr(opt, k, True)
-            elif isinstance(v, str) and v.lower() == "false":
-                setattr(opt, k, False)
-            else:
-                setattr(opt, k, v)
-    
-    # 여기서 다시 한번 파일 유무를 체크합니다.
-    opt.data = check_file(opt.data)
-    opt.cfg = check_yaml(opt.cfg)
-    # opt.hyp는 이미 딕셔너리가 되었으므로 check_yaml을 호출하지 않습니다.
-
+    opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = (
+        check_file(opt.data),
+        check_yaml(opt.cfg),
+        check_yaml(opt.hyp),
+        str(opt.weights),
+        str(opt.project),
+    )  # checks
     assert len(opt.cfg) or len(opt.weights), "either --cfg or --weights must be specified"
     if opt.name == "cfg":
         opt.name = Path(opt.cfg).stem  # use model.yaml as name

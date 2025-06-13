@@ -127,7 +127,7 @@ def run(
     conf_thres=0.001,  # confidence threshold
     iou_thres=0.6,  # NMS IoU threshold
     max_det=300,  # maximum detections per image
-    task="test",  # train, val, test, speed or study
+    task="val",  # train, val, test, speed or study
     device="",  # cuda device, i.e. 0 or 0,1,2,3 or cpu
     workers=8,  # max dataloader workers (per RANK in DDP mode)
     single_cls=False,  # treat as single-class dataset
@@ -149,8 +149,6 @@ def run(
     callbacks=Callbacks(),
     compute_loss=None,
     epoch=None,
-    rgbt=False,  # <<< 이 부분을 추가합니다.
-
 ):
     # Initialize/load model and set device
     training = model is not None
@@ -191,58 +189,26 @@ def run(
 
     # Dataloader
     if not training:
-            if pt and not single_cls:  # check --weights are trained on --data
-                ncm = model.model.nc
-                assert ncm == nc, (
-                    f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
-                    f"classes). Pass correct combination of --weights and --data that are trained together."
-                )
-            
-            # --- [수정된 Warmup 블록 시작] ---
-            if rgbt:
-                LOGGER.info('RGBT model warmup...')
-                # RGBT 모델은 [RGB, Thermal] 두 개의 입력을 리스트로 받습니다.
-                dummy_input_list = [
-                    torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=model.device),
-                    torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=model.device)
-                ]
-                if half: # half precision 적용
-                    dummy_input_list = [d.half() for d in dummy_input_list]
-                
-                # pt 모델인 경우, model.model을 직접 호출하여 warmup을 수행합니다.
-                # model.warmup() 함수를 사용하지 않고 우회합니다.
-                if pt:
-                    model.model(dummy_input_list)
-                else:
-                    # pt가 아닌 다른 백엔드(ONNX, TensorRT 등)의 RGBT 모델은
-                    # 별도의 warmup 방식이 필요할 수 있으나, 현재는 pt에 집중합니다.
-                    # 이 부분은 에러가 날 수 있으나, 우리는 pt 모델만 사용하므로 문제가 없습니다.
-                    model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))
-
-            else:  # 일반 모델인 경우 (기존 동작 유지)
-                model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))
-
-            # pad, rect 설정 로직 (이 부분은 이전과 동일하게 유지하거나, 아래처럼 명확하게 정리할 수 있습니다)
-            if task == "speed":
-                pad, rect = 0.0, False
-            elif rgbt: # RGBT 모드이고, task가 val 또는 test인 경우 (KAIST 평가 때문)
-                pad, rect = 0.5, False # RGBT를 위한 KAIST 평가 시 rect는 항상 False
-            else: # 일반적인 val 또는 test
-                pad, rect = 0.5, pt
-                
-            task_to_load = task if task in ("train", "val", "test") else "val"  # data 키 접근 전 task 이름 확정
-            dataloader = create_dataloader(
-                data[task_to_load],
-                imgsz,
-                batch_size,
-                stride,
-                single_cls,
-                pad=pad,
-                rect=rect,
-                workers=workers,
-                prefix=colorstr(f"{task_to_load}: "),
-                rgbt_input=rgbt
-            )[0]
+        if pt and not single_cls:  # check --weights are trained on --data
+            ncm = model.model.nc
+            assert ncm == nc, (
+                f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
+                f"classes). Pass correct combination of --weights and --data that are trained together."
+            )
+        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
+        task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
+        dataloader = create_dataloader(
+            data[task],
+            imgsz,
+            batch_size,
+            stride,
+            single_cls,
+            pad=pad,
+            rect=rect,
+            workers=workers,
+            prefix=colorstr(f"{task}: "),
+        )[0]
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
@@ -312,34 +278,18 @@ def run(
             # Predictions
             if single_cls:
                 pred[:, 5] = 0
-            
-            # ✅ 핵심: 예측 박스를 원본 좌표계로 스케일링하는 predn 로직을 사용하지 않고,
-            # ✅ 모델에서 나온 pred를 그대로 사용합니다. (리사이즈된 이미지 좌표계 기준)
-            
+            predn = pred.clone()
+            scale_boxes(ims[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
+
             # Evaluate
             if nl:
-                # ✅ 정답 박스(labels)를 예측 박스와 동일한 '리사이즈된 이미지' 좌표계로 변환합니다.
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                scale_boxes(ims[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct = process_batch(pred, labelsn, iouv) # ✅ predn 대신 pred 사용
+                correct = process_batch(predn, labelsn, iouv)
                 if plots:
-                    # confusion_matrix를 위한 predn 생성 (원본 좌표계)
-                    predn_for_cm = pred.clone()
-                    scale_boxes(ims[si].shape[1:], predn_for_cm[:, :4], shape, shapes[si][1])
-                    confusion_matrix.process_batch(predn_for_cm, labelsn)
+                    confusion_matrix.process_batch(predn, labelsn)
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
-
-            # Save/log
-            if save_txt or save_json: # JSON 저장을 위해 predn이 필요하므로 여기서 한 번만 계산
-                predn = pred.clone()
-                scale_boxes(ims[si].shape[1:], predn[:, :4], shape, shapes[si][1])
-
-            if save_txt:
-                (save_dir / "labels").mkdir(parents=True, exist_ok=True)
-                save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
-            if save_json:
-                save_one_json(predn, jdict, path, index, class_map)  # append to COCO-JSON dictionary
-            callbacks.run("on_val_image_end", pred, pred.clone(), path, names, ims[si])
 
             # Save/log
             if save_txt:
@@ -407,30 +357,13 @@ def run(
         LOGGER.info(f"\nEvaluating mAP...")
 
         # Run evaluation: KAIST Multispectral Pedestrian Dataset
-        if task != 'test':
-            LOGGER.info(f"\nRunning KAIST Evaluation for task '{task}'...")
-            try:
-                # task에 따라 올바른 정답 파일을 선택
-                if task == 'val':
-                    kaist_annotation_file = 'utils/eval/KAIST_val-A_annotation.json'
-                else:
-                    # 'val' 이외의 task는 기본적으로 validation annotation을 사용 (필요시 수정)
-                    kaist_annotation_file = 'utils/eval/KAIST_val-A_annotation.json'
-
-                if not os.path.exists(kaist_annotation_file):
-                    raise FileNotFoundError(f"Annotation file not found for task '{task}' at '{kaist_annotation_file}'.")
-
-                # Plotting을 위한 --evalFig 인자 추가
-                figure_filename = str(save_dir / f"{w}_miss_rate_plot.jpg")
-                eval_command = (f"python utils/eval/kaisteval.py "
-                                f"--annFile {kaist_annotation_file} "
-                                f"--rstFile {pred_json} "
-                                f"--evalFig {figure_filename}")
-                LOGGER.info(f"Running command: {eval_command}")
-                os.system(eval_command)
-
-            except Exception as e:
-                LOGGER.info(f"kaisteval unable to run: {e}")
+        try:
+            # HACK: need to generate KAIST_annotation.json for your own validation set
+            if not os.path.exists('utils/eval/KAIST_val-A_annotation.json'):
+                raise FileNotFoundError('Please generate KAIST_annotation.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
+            os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_val-A_annotation.json --rstFile {pred_json}")
+        except Exception as e:
+            LOGGER.info(f"kaisteval unable to run: {e}")
 
     # Return results
     model.float()  # for training
@@ -453,7 +386,7 @@ def parse_opt():
     parser.add_argument("--conf-thres", type=float, default=0.001, help="confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=0.6, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=300, help="maximum detections per image")
-    parser.add_argument("--task", default="test", help="train, val, test, speed or study")
+    parser.add_argument("--task", default="val", help="train, val, test, speed or study")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
     parser.add_argument("--single-cls", action="store_true", help="treat as single-class dataset")
@@ -468,8 +401,6 @@ def parse_opt():
     parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
-    parser.add_argument("--rgbt", action="store_true", help="Feed RGB-T multispectral image pair.")
-    # parser.add_argument("--model", default="yolov5s", help="model type")
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith("coco.yaml")
