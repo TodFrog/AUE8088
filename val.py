@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import cv2
 
 import numpy as np
 import torch
@@ -58,6 +59,15 @@ from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
+KAIST_ID_MAP = None
+def _load_kaist_id_map():
+    global KAIST_ID_MAP
+    if KAIST_ID_MAP is None:
+        with open("D:/AUE8088/utils/eval/KAIST_val-A_annotation.json", "r") as f:       # 경로 맞게 수정
+            ann = json.load(f)
+        # im_name → id
+        KAIST_ID_MAP = {Path(img["im_name"]).stem: img["id"] for img in ann["images"]}
+_load_kaist_id_map()
 
 def save_one_txt(predn, save_conf, shape, file):
     """Saves one detection result to a txt file in normalized xywh format, optionally including confidence."""
@@ -70,26 +80,23 @@ def save_one_txt(predn, save_conf, shape, file):
 
 
 def save_one_json(predn, jdict, path, index, class_map):
-    """
-    Saves one JSON detection result with image ID, category ID, bounding box, and score.
+    # 1) 올바른 image_id 얻기
+    stem = path.stem
+    image_id = int(KAIST_ID_MAP.get(stem, int(index)))   # test 세트는 idx 로 fallback
+    # 2) box 변환은 그대로
+    box = xyxy2xywh(predn[:, :4])
+    box[:, :2] -= box[:, 2:] / 2
 
-    Example: {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
-    """
-    image_id = int(path.stem) if path.stem.isnumeric() else path.stem
-    box = xyxy2xywh(predn[:, :4])  # xywh
-    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
     for p, b in zip(predn.tolist(), box.tolist()):
         if p[4] < 0.1:
             continue
-        jdict.append(
-            {
-                "image_name": image_id,
-                "image_id": int(index),
-                "category_id": class_map[int(p[5])],
-                "bbox": [round(x, 3) for x in b],
-                "score": round(p[4], 5),
-            }
-        )
+        jdict.append({
+            "image_name": path.stem,            # ← 원본 파일명(stem)
+            "image_id": image_id,               # ← 정수 ID
+            "category_id": int(class_map[int(p[5])]),
+            "bbox": [round(float(x), 3) for x in b],
+            "score": round(float(p[4]), 5)
+        })
 
 
 def process_batch(detections, labels, iouv):
@@ -149,6 +156,7 @@ def run(
     callbacks=Callbacks(),
     compute_loss=None,
     epoch=None,
+    rgbt=False,  # <<< 이 부분을 추가합니다.
 ):
     # Initialize/load model and set device
     training = model is not None
@@ -189,26 +197,58 @@ def run(
 
     # Dataloader
     if not training:
-        if pt and not single_cls:  # check --weights are trained on --data
-            ncm = model.model.nc
-            assert ncm == nc, (
-                f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
-                f"classes). Pass correct combination of --weights and --data that are trained together."
-            )
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
-        pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
-        task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
-        dataloader = create_dataloader(
-            data[task],
-            imgsz,
-            batch_size,
-            stride,
-            single_cls,
-            pad=pad,
-            rect=rect,
-            workers=workers,
-            prefix=colorstr(f"{task}: "),
-        )[0]
+            if pt and not single_cls:  # check --weights are trained on --data
+                ncm = model.model.nc
+                assert ncm == nc, (
+                    f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
+                    f"classes). Pass correct combination of --weights and --data that are trained together."
+                )
+            
+            # --- [수정된 Warmup 블록 시작] ---
+            if rgbt:
+                LOGGER.info('RGBT model warmup...')
+                # RGBT 모델은 [RGB, Thermal] 두 개의 입력을 리스트로 받습니다.
+                dummy_input_list = [
+                    torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=model.device),
+                    torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=model.device)
+                ]
+                if half: # half precision 적용
+                    dummy_input_list = [d.half() for d in dummy_input_list]
+                
+                # pt 모델인 경우, model.model을 직접 호출하여 warmup을 수행합니다.
+                # model.warmup() 함수를 사용하지 않고 우회합니다.
+                if pt:
+                    model.model(dummy_input_list)
+                else:
+                    # pt가 아닌 다른 백엔드(ONNX, TensorRT 등)의 RGBT 모델은
+                    # 별도의 warmup 방식이 필요할 수 있으나, 현재는 pt에 집중합니다.
+                    # 이 부분은 에러가 날 수 있으나, 우리는 pt 모델만 사용하므로 문제가 없습니다.
+                    model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))
+
+            else:  # 일반 모델인 경우 (기존 동작 유지)
+                model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))
+
+            # pad, rect 설정 로직 (이 부분은 이전과 동일하게 유지하거나, 아래처럼 명확하게 정리할 수 있습니다)
+            if task == "speed":
+                pad, rect = 0.0, False
+            elif rgbt: # RGBT 모드이고, task가 val 또는 test인 경우 (KAIST 평가 때문)
+                pad, rect = 0.5, False # RGBT를 위한 KAIST 평가 시 rect는 항상 False
+            else: # 일반적인 val 또는 test
+                pad, rect = 0.5, pt
+                
+            task_to_load = task if task in ("train", "val", "test") else "val"  # data 키 접근 전 task 이름 확정
+            dataloader = create_dataloader(
+                data[task_to_load],
+                imgsz,
+                batch_size,
+                stride,
+                single_cls,
+                pad=pad,
+                rect=rect,
+                workers=workers,
+                prefix=colorstr(f"{task_to_load}: "),
+                rgbt_input=rgbt
+            )[0]
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
@@ -239,7 +279,6 @@ def run(
                     ims = ims.half()
 
             targets = targets.to(device)
-
         # Inference
         with dt[1]:
             preds, train_out = model(ims) if compute_loss else (model(ims, augment=augment), None)
@@ -314,10 +353,12 @@ def run(
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
 
-    # filter out ignore labels when counting the number of gt boxes
-    lbls = stats[3].astype(int)
-    lbls = lbls[lbls >= 0]
-    nt = np.bincount(lbls, minlength=nc)  # number of targets per class
+    all_tcls = stats[3]
+    valid_tcls = all_tcls[all_tcls >= 0].astype(int) # -1을 제외한 유효한 클래스 ID만 사용
+
+    # nc (number of classes)는 val.py에서 정의된 값을 사용합니다.
+    # single_cls=True 이면 nc=1, 아니면 data['nc']
+    nt = np.bincount(valid_tcls, minlength=nc) # nt는 여기서 계산
 
     # Print results
     pf = "%22s" + "%11i" * 2 + "%11.3g" * 4  # print format
@@ -342,6 +383,18 @@ def run(
         callbacks.run("on_val_end", nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix)
 
     # Save JSON
+    if task == "test":
+        # GT가 없는 test split: 예측 JSON만 저장하고 리턴
+        if save_json and len(jdict):
+            # ▶️ weights 가 str, list, tuple 모두 올 수 있음
+            w = weights[0] if isinstance(weights, (list, tuple)) else weights
+            json_path = save_dir / f"{Path(w).stem}_predictions.json"
+
+            with open(json_path, "w") as f:
+                json.dump(jdict, f, indent=2)
+            LOGGER.info(f"Test predictions saved to {json_path}")
+        return  # mAP/MR 계산 건너뜀
+
     if save_json and len(jdict):
         if weights:
             w = Path(weights[0] if isinstance(weights, list) else weights).stem
@@ -361,7 +414,7 @@ def run(
             # HACK: need to generate KAIST_annotation.json for your own validation set
             if not os.path.exists('utils/eval/KAIST_val-A_annotation.json'):
                 raise FileNotFoundError('Please generate KAIST_annotation.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
-            os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_val-A_annotation.json --rstFile {pred_json}")
+            os.system(f"python utils/eval/kaisteval.py --annFile utils/eval/KAIST_val-A_annotation.json --rstFile {pred_json}")
         except Exception as e:
             LOGGER.info(f"kaisteval unable to run: {e}")
 
@@ -401,6 +454,7 @@ def parse_opt():
     parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
+    parser.add_argument("--rgbt", action="store_true", help="Feed RGB-T multispectral image pair.")
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith("coco.yaml")

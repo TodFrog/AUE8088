@@ -8,11 +8,11 @@
 #     └── data ── kaist-rgbt.yaml
 
 # Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
-path: datasets/kaist-rgbt
+path: D:/AUE8088/datasets/kaist-rgbt
 train: # train files info (relative to 'path') 12,538 images
   - train-all-04.txt      # TODO: Please separate this file into train/val
 val: # val files info (relative to 'path')  12,538 images
-  - test-all-20.txt
+  - val-split.txt
 test: # test files info (optional)
   - test-all-20.txt
 
@@ -22,6 +22,19 @@ names:
   1: cyclist
   2: people
   3: person?
+
+# Hyperparameters for training (추가된 부분)
+# These will be passed to ComputeLoss in loss.py
+hyp:
+  iou_type: WIoU # Set to 'WIoU' to use Wise-IoU loss for bounding box regression
+                # Or 'CIoU' for standard Complete IoU loss (default in original YOLOv5)
+  fl_gamma: 1.5  # Gamma for FocalLoss/QFocalLoss (adjust as needed, typical values 1.5 to 2.0)
+  cls_pw: 1.0    # Class positive weight (adjust for class imbalance)
+  obj_pw: 1.0    # Objectness positive weight (adjust for objectness imbalance)
+  box: 0.05      # Box loss gain
+  obj: 1.0       # Obj loss gain
+  cls: 0.5       # Cls loss gain
+  # Other hyperparameters for training should also be here or in a separate hyp file and linked.
 
 # Download script/URL (optional) ---------------------------------------------------------------------------------------
 download: |

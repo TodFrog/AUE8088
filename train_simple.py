@@ -153,7 +153,21 @@ def train(hyp, opt, device, callbacks):
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
-
+    
+    # [START MODIFICATION] Freeze layers functionality added here
+    if len(opt.freeze):
+        freeze_layers = [f'model.{x}.' for x in opt.freeze] # Convert indices to module names
+        for k, v in model.named_parameters():
+            if any(x in k for x in freeze_layers):
+                LOGGER.info(f'freezing {k}')
+                v.requires_grad = False
+    
+    # Log trainable parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    LOGGER.info(f"{trainable_params} trainable parameters out of {total_params} total parameters.")
+    # [END MODIFICATION]
+    
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
@@ -185,7 +199,7 @@ def train(hyp, opt, device, callbacks):
         gs,
         single_cls,
         hyp=hyp,
-        augment=False,      # TODO: make it work
+        augment=True,      # TODO: make it work
         cache=None if opt.cache == "val" else opt.cache,
         rect=opt.rect,
         rank=-1,
@@ -340,6 +354,8 @@ def train(hyp, opt, device, callbacks):
                 callbacks=callbacks,
                 compute_loss=compute_loss,
                 epoch=epoch,
+                task='val',  # <--- ✅ 이 인자를 추가해야 합니다!
+                rgbt=opt.rgbt 
             )
 
         # Update best mAP
@@ -446,7 +462,7 @@ def parse_opt(known=False):
     parser.add_argument("--cos-lr", action="store_true", help="cosine LR scheduler")
     parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon")
     parser.add_argument("--patience", type=int, default=100, help="EarlyStopping patience (epochs without improvement)")
-    # parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
+    parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
     parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")

@@ -748,21 +748,23 @@ def colorstr(*input):
 
 
 def labels_to_class_weights(labels, nc=80):
-    """Calculates class weights from labels to handle class imbalance in training; input shape: (n, 5)."""
-    if labels[0] is None:  # no labels loaded
-        return torch.Tensor()
+    # YOLOv5 class weights (inverse frequency) https://github.com/ultralytics/yolov5/issues/4125
+    #c, freq = np.unique(labels, return_counts=True)
+    #return torch.tensor(freq.astype(np.float32) / freq.sum(), device=device)
 
-    labels = np.concatenate(labels, 0)  # labels.shape = (866643, 5) for COCO
-    classes = labels[:, 0].astype(int)  # labels = [class xywh]
+    # Get class frequency
+    classes = np.concatenate([x[:, 0] for x in labels], 0).astype(int)
+    
+    # --- 수정 시작 ---
+    # 음수 클래스 ID 필터링 (ignore_idx로 설정된 -1 값 제거)
+    classes = classes[classes >= 0]
+    # --- 수정 끝 ---
+
     weights = np.bincount(classes, minlength=nc)  # occurrences per class
-
-    # Prepend gridpoint count (for uCE training)
-    # gpi = ((320 / 32 * np.array([1, 2, 4])) ** 2 * 3).sum()  # gridpoints per image
-    # weights = np.hstack([gpi * len(labels)  - weights.sum() * 9, weights * 9]) ** 0.5  # prepend gridpoints to start
-
-    weights[weights == 0] = 1  # replace empty bins with 1
-    weights = 1 / weights  # number of targets per class
-    weights /= weights.sum()  # normalize
+    # weights[0] = sum(weights[1:]) # if background is not counted
+    weights[weights == 0] = 1  # replace empty bins with 1 for stability
+    weights = 1 / weights  # inverse frequency (1/P(class))
+    weights /= weights.sum()  # normalize for P(class)
     return torch.from_numpy(weights).float()
 
 

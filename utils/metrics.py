@@ -47,19 +47,25 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir=".", names
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
     # Find unique classes
-    unique_classes, nt = np.unique(target_cls, return_counts=True)
+    original_unique_classes, original_nt_counts = np.unique(target_cls, return_counts=True)
 
-    # remove ignore class
-    unique_classes = unique_classes[unique_classes != -1]
-    nc = unique_classes.shape[0]  # number of classes, number of detections
+    # remove ignore class (-1) and update nt accordingly
+    valid_class_indices = original_unique_classes != -1
+    unique_classes = original_unique_classes[valid_class_indices]
+    nt = original_nt_counts[valid_class_indices] # <- nt도 유효한 클래스에 맞춰 필터링
+
+    nc = unique_classes.shape[0]  # number of classes
 
     # Create Precision-Recall curve and compute AP for each class
     px, py = np.linspace(0, 1, 1000), []  # for plotting
     ap, p, r = np.zeros((nc, tp.shape[1])), np.zeros((nc, 1000)), np.zeros((nc, 1000))
     for ci, c in enumerate(unique_classes):
         i = pred_cls == c
-        n_l = nt[ci]  # number of labels
-        n_p = i.sum()  # number of predictions
+        
+        # n_l은 현재 클래스 c에 해당하는 실제 레이블(ground truth)의 개수
+        # nt 배열의 ci번째 요소가 클래스 c의 실제 레이블 개수입니다.
+        n_l = nt[ci] 
+        n_p = i.sum()  # number of predictions for class c
         if n_p == 0 or n_l == 0:
             continue
 
@@ -83,16 +89,30 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir=".", names
 
     # Compute F1 (harmonic mean of precision and recall)
     f1 = 2 * p * r / (p + r + eps)
-    names = [v for k, v in names.items() if k in unique_classes]  # list: only classes that have data
-    names = dict(enumerate(names))  # to dict
+    
+    # names 필터링 (unique_classes에 있는 이름만 남김)
+    # 기존 코드: names = [v for k, v in names.items() if k in unique_classes]  # list: only classes that have data
+    # names = dict(enumerate(names))  # to dict
+    # names는 원래 모델의 전체 클래스 이름 딕셔너리입니다. unique_classes는 실제 데이터에 나타난 클래스들.
+    # 따라서 names를 unique_classes에 맞게 필터링하고 재정의하는 것은 맞습니다.
+    # names가 딕셔너리이고, unique_classes가 np.array이므로, 다음과 같이 처리하는 것이 안전합니다.
+    filtered_names_list = [names[c] for c in unique_classes]
+    # 이 부분은 ap_per_class 외부에 영향을 주지 않으므로, 원래 names 딕셔너리를 직접 수정하는 것은 피합니다.
+    # plot 함수에 전달할 때만 필터링된 이름을 사용합니다.
+    
     if plot:
-        plot_pr_curve(px, py, ap, Path(save_dir) / f"{prefix}PR_curve.png", names)
-        plot_mc_curve(px, f1, Path(save_dir) / f"{prefix}F1_curve.png", names, ylabel="F1")
-        plot_mc_curve(px, p, Path(save_dir) / f"{prefix}P_curve.png", names, ylabel="Precision")
-        plot_mc_curve(px, r, Path(save_dir) / f"{prefix}R_curve.png", names, ylabel="Recall")
+        plot_pr_curve(px, py, ap, Path(save_dir) / f"{prefix}PR_curve.png", {k: v for k,v in names.items() if k in unique_classes}) # unique_classes에 있는 이름만 전달
+        plot_mc_curve(px, f1, Path(save_dir) / f"{prefix}F1_curve.png", {k: v for k,v in names.items() if k in unique_classes}, ylabel="F1")
+        plot_mc_curve(px, p, Path(save_dir) / f"{prefix}P_curve.png", {k: v for k,v in names.items() if k in unique_classes}, ylabel="Precision")
+        plot_mc_curve(px, r, Path(save_dir) / f"{prefix}R_curve.png", {k: v for k,v in names.items() if k in unique_classes}, ylabel="Recall")
+
 
     i = smooth(f1.mean(0), 0.1).argmax()  # max F1 index
     p, r, f1 = p[:, i], r[:, i], f1[:, i]
+    
+    # 여기서 `nt`는 unique_classes에 해당하는 실제 GT 개수여야 합니다.
+    # 이미 위에서 `nt = original_nt_counts[valid_class_indices]`로 올바르게 필터링되었으므로,
+    # 이 `nt`를 사용하면 됩니다.
     tp = (r * nt).round()  # true positives
     fp = (tp / (p + eps) - tp).round()  # false positives
     return tp, fp, p, r, f1, ap, unique_classes.astype(int)
@@ -259,21 +279,75 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
 
     # IoU
     iou = inter / union
-    if CIoU or DIoU or GIoU:
+    # Calculate different IoU types
+    if GIoU:
         cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
         ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
-        if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
-            c2 = cw**2 + ch**2 + eps  # convex diagonal squared
-            rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center dist ** 2
-            if CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
-                v = (4 / math.pi**2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
-                with torch.no_grad():
-                    alpha = v / (v - iou + (1 + eps))
-                return iou - (rho2 / c2 + v * alpha)  # CIoU
-            return iou - rho2 / c2  # DIoU
         c_area = cw * ch + eps  # convex area
-        return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf
-    return iou  # IoU
+        return iou - (c_area - union) / c_area  # GIoU
+    elif DIoU or CIoU or WIoU:
+        # Center point distance squared
+        c_x = (b1_x1 + b1_x2) / 2 - (b2_x1 + b2_x2) / 2
+        c_y = (b1_y1 + b1_y2) / 2 - (b2_y1 + b2_y2) / 2
+        rho2 = c_x**2 + c_y**2
+
+        # Minimum enclosing box diagonal squared
+        cw_enclosing = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)
+        ch_enclosing = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)
+        c2 = cw_enclosing**2 + ch_enclosing**2 + eps # convex diagonal squared
+
+        if DIoU:
+            return iou - rho2 / c2  # DIoU
+        elif CIoU:
+            v = (4 / math.pi**2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
+            with torch.no_grad():
+                alpha = v / (v - iou + (1 + eps))
+            return iou - (rho2 / c2 + v * alpha)  # CIoU
+        elif WIoU:
+            # ---------------- WIoU-v3 loss ----------------
+            # 기본 IoU loss
+            #iou_loss = 1.0 - iou                 # L_IoU
+
+            # 중심 거리 항 (DIoU/CIoU와 동일한 정의)
+            #dist_ratio = rho2 / c2               # 0 ~ 1
+
+            # 하이퍼파라미터(β):  yaml > `wiou_beta` (기본 2.0)
+            #beta = 2.0
+
+            # WIoU v3 포커싱 팩터 R_WIoU  ≈ exp(dist_ratio^β)
+            #weight = torch.exp(dist_ratio ** beta)
+
+            #wiou_loss = iou_loss * weight        # L_WIoU
+            #return wiou_loss                     # ←  ComputeLoss에서 바로 mean() 해줌
+            
+            
+            # ---------- WIoU-v3 ----------
+            #   · IoU 자체는 그대로 두고
+            #   · 중심 거리 항과 종횡비 차이를 가중치로 사용해 "wise" 가중 IoU 점수를 만듦
+            #   · wiou_score ∈ [0, 1]  →  Loss = 1 - wiou_score
+
+            # ① 중심 거리 가중치
+            #    outlier_degree_c ∈ [0, 1]  (멀수록 0에 가까워짐)
+            outlier_degree_c = torch.exp(-4 * rho2 / (c2 + eps))          # 논문 β₁=4
+
+            # ② 종횡비 가중치
+            ar_gt   = w2 / (h2 + eps)
+            ar_pred = w1 / (h1 + eps)
+            ar_diff = torch.abs(torch.atan(ar_gt) - torch.atan(ar_pred))  # 각도 차
+            outlier_degree_ar = torch.exp(-2 * ar_diff)                   # 논문 β₂=2
+
+            # ③ IoU 손실(base)  = 1 - IoU
+            iou_loss_base = 1.0 - iou
+
+            # ④ Wise 가중치 r  (비선형 포커싱, 논문 β=0.25 기본)
+            r = (iou_loss_base + eps).pow(beta)       # β = 0.25 (default)
+
+            # ⑤ 최종 WIoU 점수
+            wiou_score = iou * outlier_degree_c * outlier_degree_ar
+            wiou_loss  = 1.0 - wiou_score
+            return wiou_loss * r                     # → ‘Loss’를 직접 돌려줌
+
+    return iou  # IoU (default, or if no specific type is requested)
 
 
 def box_iou(box1, box2, eps=1e-7):

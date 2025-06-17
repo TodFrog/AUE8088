@@ -626,27 +626,27 @@ def evaluate(test_annotation_file: str, user_submission_file: str, phase_codenam
     print('')
     # eval_result['day'].params.imgIds = imgIds[:1455]
     eval_result['day'].params.imgIds = [ii for ii, img in kaistGt.imgs.items() if get_time_of_day(img['im_name']) == 'day']
-    eval_result['day'].evaluate(0)
-    eval_result['day'].accumulate()
-    MR_day = eval_result['day'].summarize(0, subsetStr='Day')
-    metrics['MR_-2_iou50_day'] = MR_day[0]
-    # metrics['MR_-2_iou60_day'] = MR_day[1]
-    # metrics['MR_-2_iou75_day'] = MR_day[2]
+    # ✅ [수정] Day 이미지가 있을 때만 평가를 수행하도록 조건문 추가
+    if eval_result['day'].params.imgIds:
+        eval_result['day'].evaluate(0)
+        eval_result['day'].accumulate()
+        MR_day = eval_result['day'].summarize(0, subsetStr='Day')
+        metrics['MR_-2_iou50_day'] = MR_day[0]
+    else:
+        print("No 'Day' images found in the dataset. Skipping Day evaluation.")
+
 
     print('')
-    # eval_result['night'].params.imgIds = imgIds[1455:]
-    eval_result['day'].params.imgIds = [ii for ii, img in kaistGt.imgs.items() if get_time_of_day(img['im_name']) == 'night']
-    eval_result['night'].evaluate(0)
-    eval_result['night'].accumulate()
-    MR_night = eval_result['night'].summarize(0, subsetStr='Night')
-    metrics['MR_-2_iou50_night'] = MR_night[0]
-    # metrics['MR_-2_iou60_night'] = MR_night[1]
-    # metrics['MR_-2_iou75_night'] = MR_night[2]
-
-    # # recall_all = 1 - eval_result['all'].eval['yy'][0][-1]
-    # msg = f'\n########## Method: {method} ##########\n' \
-    #     + f'MR_all: {metrics["MR_-2_iou50_all"] * 100:.2f}\n' \
-    #     + f'MR_day: {metrics["MR_-2_iou50_day"] * 100:.2f}\n' \
+    # Night 평가 부분
+    eval_result['night'].params.imgIds = [ii for ii, img in kaistGt.imgs.items() if get_time_of_day(img['im_name']) == 'night']
+    # ✅ [수정] Night 이미지가 있을 때만 평가를 수행하도록 조건문 추가
+    if eval_result['night'].params.imgIds:
+        eval_result['night'].evaluate(0)
+        eval_result['night'].accumulate()
+        MR_night = eval_result['night'].summarize(0, subsetStr='Night')
+        metrics['MR_-2_iou50_night'] = MR_night[0]
+    else:
+        print("No 'Night' images found in the dataset. Skipping Night evaluation.")
     #     + f'MR_night: {metrics["MR_-2_iou50_night"] * 100:.2f}\n' \
     #     + '######################################\n\n'
     #     # + f'recall_all: {recall_all * 100:.2f}\n' \

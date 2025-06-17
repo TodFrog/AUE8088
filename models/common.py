@@ -525,6 +525,8 @@ class DetectMultiBackend(nn.Module):
             names = model.module.names if hasattr(model, "module") else model.names  # get class names
             model.half() if fp16 else model.float()
             self.model = model  # explicitly assign for to(), cpu(), cuda(), half()
+            print(f"DEBUG: Inside __init__, local pt variable is: {pt}") # 디버깅_1
+
         elif jit:  # TorchScript
             LOGGER.info(f"Loading {w} for TorchScript inference...")
             extra_files = {"config.txt": ""}  # model metadata
@@ -709,87 +711,238 @@ class DetectMultiBackend(nn.Module):
             names = yaml_load(ROOT / "data/ImageNet.yaml")["names"]  # human-readable names
 
         self.__dict__.update(locals())  # assign all variables to self
+        print(f"DEBUG: Inside __init__, self.pt attribute is: {self.pt}") # 디버깅_2
+
 
     def forward(self, im, augment=False, visualize=False):
         """Performs YOLOv5 inference on input images with options for augmentation and visualization."""
-        b, ch, h, w = im.shape  # batch, channel, height, width
-        if self.fp16 and im.dtype != torch.float16:
-            im = im.half()  # to FP16
-        if self.nhwc:
-            im = im.permute(0, 2, 3, 1)  # torch BCHW to numpy BHWC shape(1,320,192,3)
 
-        if self.pt:  # PyTorch
-            y = self.model(im, augment=augment, visualize=visualize) if augment or visualize else self.model(im)
+        # --- 입력 처리 (RGBT 및 단일 입력 공통) ---
+        # input_to_use: 실제 모델 및 백엔드에 전달될 최종 입력 (텐서 또는 텐서 리스트)
+        if isinstance(im, list):  # RGBT 입력 (텐서 리스트)
+            input_to_use = []
+            for single_tensor in im:
+                processed_tensor = single_tensor
+                if self.fp16 and processed_tensor.dtype != torch.float16:
+                    processed_tensor = processed_tensor.half()
+                # PyTorch RGBT 모델은 일반적으로 각 스트림을 BCHW 형태로 기대합니다.
+                # self.nhwc는 여기서 적용하지 않습니다 (주로 TensorFlow 등 다른 백엔드용).
+                input_to_use.append(processed_tensor)
+        else:  # 단일 텐서 입력
+            input_to_use = im
+            if self.fp16 and input_to_use.dtype != torch.float16:
+                input_to_use = input_to_use.half()
+            # self.nhwc는 PyTorch 모델에는 적용하지 않고,
+            # 다른 백엔드 처리 직전에 해당 백엔드가 NHWC를 요구할 경우 적용합니다.
+            # 따라서 여기서 미리 self.nhwc를 적용하지 않습니다.
+        # --- 입력 처리 끝 ---
+
+
+        # --- 백엔드별 추론 ---
+        if self.pt:  # PyTorch 모델
+            # RGBT 모델(self.model)은 input_to_use (리스트)를 받아 처리해야 합니다.
+            # 단일 이미지의 경우 input_to_use는 텐서입니다.
+            y = self.model(input_to_use, augment=augment, visualize=visualize) if augment or visualize else self.model(input_to_use)
+
         elif self.jit:  # TorchScript
-            y = self.model(im)
+            # JIT 모델이 리스트 입력을 지원하도록 트레이스 되었는지 확인 필요.
+            if isinstance(input_to_use, list):
+                LOGGER.warning("RGBT (list input) passed to JIT. JIT model might not support list input. Using first stream.")
+                # JIT 모델이 단일 텐서만 받는다고 가정하고 첫 번째 스트림 사용 (임시)
+                y = self.model(input_to_use[0])
+            else:
+                y = self.model(input_to_use)
+        
         elif self.dnn:  # ONNX OpenCV DNN
-            im = im.cpu().numpy()  # torch to numpy
-            self.net.setInput(im)
+            # OpenCV DNN은 단일 입력만 지원할 가능성이 높습니다.
+            if isinstance(input_to_use, list):
+                LOGGER.warning("RGBT (list input) to OpenCV DNN. Using first stream.")
+                current_im_for_backend = input_to_use[0].cpu().numpy() # NHWC 변환은 OpenCV 내부에서 처리될 수 있음
+            else:
+                current_im_for_backend = input_to_use.cpu().numpy()
+            # self.nhwc 플래그에 따른 변환은 여기서 필요 없을 수 있습니다. OpenCV DNN은 일반적으로 NCHW를 받습니다.
+            self.net.setInput(current_im_for_backend)
             y = self.net.forward()
+
         elif self.onnx:  # ONNX Runtime
-            im = im.cpu().numpy()  # torch to numpy
-            y = self.session.run(self.output_names, {self.session.get_inputs()[0].name: im})
+            if isinstance(input_to_use, list):
+                LOGGER.warning("RGBT (list input) to ONNX Runtime. Using first stream.")
+                current_im_for_backend = input_to_use[0].cpu().numpy()
+            else:
+                current_im_for_backend = input_to_use.cpu().numpy()
+            # ONNX 모델은 일반적으로 NCHW를 기대합니다. self.nhwc는 여기서는 사용하지 않습니다.
+            y = self.session.run(self.output_names, {self.session.get_inputs()[0].name: current_im_for_backend})
+        
         elif self.xml:  # OpenVINO
-            im = im.cpu().numpy()  # FP32
-            y = list(self.ov_compiled_model(im).values())
+            if isinstance(input_to_use, list):
+                LOGGER.warning("RGBT (list input) to OpenVINO. Using first stream.")
+                current_im_for_backend = input_to_use[0].cpu().numpy() # OpenVINO는 NCHW FP32를 주로 사용
+            else:
+                current_im_for_backend = input_to_use.cpu().numpy()
+            y = list(self.ov_compiled_model(current_im_for_backend).values())
+
         elif self.engine:  # TensorRT
-            if self.dynamic and im.shape != self.bindings["images"].shape:
-                i = self.model.get_binding_index("images")
-                self.context.set_binding_shape(i, im.shape)  # reshape if dynamic
-                self.bindings["images"] = self.bindings["images"]._replace(shape=im.shape)
-                for name in self.output_names:
-                    i = self.model.get_binding_index(name)
-                    self.bindings[name].data.resize_(tuple(self.context.get_binding_shape(i)))
-            s = self.bindings["images"].shape
-            assert im.shape == s, f"input size {im.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
-            self.binding_addrs["images"] = int(im.data_ptr())
+            # TensorRT는 RGBT 리스트 입력을 직접 지원하지 않으므로, 모델이 단일 입력으로 변환되거나,
+            # 각 스트림을 별도로 처리 후 융합하는 커스텀 로직이 필요합니다.
+            # 여기서는 단일 스트림만 처리하는 것으로 단순화합니다.
+            current_tensor_for_engine = None
+            if isinstance(input_to_use, list):
+                LOGGER.warning("RGBT (list input) to TensorRT. Using first stream.")
+                current_tensor_for_engine = input_to_use[0]
+            else:
+                current_tensor_for_engine = input_to_use
+            
+            # TensorRT의 dynamic shape 처리 및 바인딩 로직은 current_tensor_for_engine (단일 텐서) 기준으로 진행
+            if self.dynamic and current_tensor_for_engine.shape != self.bindings["images"].shape:
+                i = self.model.get_binding_index("images") # model은 TensorRT 엔진 객체
+                self.context.set_binding_shape(i, current_tensor_for_engine.shape)
+                self.bindings["images"] = self.bindings["images"]._replace(shape=current_tensor_for_engine.shape)
+                for name_ in self.output_names: # name 변수명 충돌 피하기 위해 name_ 사용
+                    i = self.model.get_binding_index(name_)
+                    self.bindings[name_].data.resize_(tuple(self.context.get_binding_shape(i)))
+            
+            s_engine = self.bindings["images"].shape
+            assert current_tensor_for_engine.shape == s_engine, \
+                f"Input size {current_tensor_for_engine.shape} {'not equal to' if not self.dynamic else '>'} max model size {s_engine}"
+            self.binding_addrs["images"] = int(current_tensor_for_engine.data_ptr())
             self.context.execute_v2(list(self.binding_addrs.values()))
             y = [self.bindings[x].data for x in sorted(self.output_names)]
+
         elif self.coreml:  # CoreML
-            im = im.cpu().numpy()
-            im = Image.fromarray((im[0] * 255).astype("uint8"))
-            # im = im.resize((192, 320), Image.BILINEAR)
-            y = self.model.predict({"image": im})  # coordinates are xywh normalized
-            if "confidence" in y:
-                box = xywh2xyxy(y["coordinates"] * [[w, h, w, h]])  # xyxy pixels
-                conf, cls = y["confidence"].max(1), y["confidence"].argmax(1).astype(np.float)
+            # CoreML도 단일 이미지 입력을 주로 사용합니다.
+            current_im_for_backend_numpy = None
+            if isinstance(input_to_use, list):
+                LOGGER.warning("RGBT (list input) to CoreML. Using first stream.")
+                current_im_for_backend_numpy = input_to_use[0].cpu().numpy()
+            else:
+                current_im_for_backend_numpy = input_to_use.cpu().numpy()
+            
+            # CoreML은 입력이 (batch=1, H, W, C) 형태의 PIL 이미지 또는 CVPixelBuffer를 기대할 수 있음.
+            # 현재 코드는 (batch=1, C, H, W) numpy 배열을 (H,W,C)로 변환 후 PIL 이미지로 만듦
+            # (이 부분은 CoreML 모델의 입력 사양에 따라 달라질 수 있음)
+            # b, ch, h, w = current_im_for_backend_numpy.shape # 여기서 shape 사용
+            pil_im = Image.fromarray((current_im_for_backend_numpy[0] * 255).astype("uint8").transpose(1,2,0)) # BCHW to HWC
+            
+            # 원본 코드에서 w, h 변수를 참조하므로, 여기서 정의합니다.
+            # CoreML 입력 이미지의 실제 너비와 높이를 사용해야 합니다.
+            # 여기서는 input_to_use (또는 그 첫 번째 요소)의 원래 너비, 높이를 사용한다고 가정합니다.
+            # 또는 PIL 이미지에서 가져옵니다.
+            effective_w, effective_h = pil_im.size
+
+            y_coreml_dict = self.model.predict({"image": pil_im})
+            if "confidence" in y_coreml_dict:
+                box = xywh2xyxy(y_coreml_dict["coordinates"] * [[effective_w, effective_h, effective_w, effective_h]])
+                conf, cls = y_coreml_dict["confidence"].max(1), y_coreml_dict["confidence"].argmax(1).astype(np.float32)
                 y = np.concatenate((box, conf.reshape(-1, 1), cls.reshape(-1, 1)), 1)
             else:
-                y = list(reversed(y.values()))  # reversed for segmentation models (pred, proto)
-        elif self.paddle:  # PaddlePaddle
-            im = im.cpu().numpy().astype(np.float32)
-            self.input_handle.copy_from_cpu(im)
+                y = list(reversed(y_coreml_dict.values()))
+        
+        elif self.paddle: # PaddlePaddle
+            if isinstance(input_to_use, list):
+                LOGGER.warning("RGBT (list input) to PaddlePaddle. Using first stream.")
+                current_im_for_backend = input_to_use[0].cpu().numpy().astype(np.float32)
+            else:
+                current_im_for_backend = input_to_use.cpu().numpy().astype(np.float32)
+            self.input_handle.copy_from_cpu(current_im_for_backend)
             self.predictor.run()
             y = [self.predictor.get_output_handle(x).copy_to_cpu() for x in self.output_names]
+
         elif self.triton:  # NVIDIA Triton Inference Server
-            y = self.model(im)
+            # Triton 모델이 RGBT 리스트 입력을 지원하는지 확인 필요
+            y = self.model(input_to_use)
+
         else:  # TensorFlow (SavedModel, GraphDef, Lite, Edge TPU)
-            im = im.cpu().numpy()
+            # 이 블록은 self.pt, self.jit 등이 모두 False일 때 실행됩니다.
+            # RGBT의 경우, 단일 텐서를 기대하는 이 경로로 들어오면 안 됩니다.
+            # 만약 들어왔다면 self.pt 설정에 문제가 있었던 것입니다.
+            current_tf_input_numpy = None
+            if isinstance(input_to_use, list):
+                LOGGER.error(
+                    "Critical Error: RGBT (list input) reached TensorFlow backend path. "
+                    "This should have been handled by self.pt=True. Check __init__ model type detection."
+                )
+                # 문제가 심각하므로, 여기서 에러를 발생시키거나 매우 제한적인 처리만 수행해야 합니다.
+                # 예시: 첫 번째 스트림의 numpy 배열 사용
+                current_tf_input_numpy = input_to_use[0].cpu().numpy()
+            else:
+                current_tf_input_numpy = input_to_use.cpu().numpy()
+
+            # TensorFlow 백엔드는 일반적으로 NHWC 포맷을 기대할 수 있습니다.
+            # self.nhwc 플래그가 True라면 여기서 변환합니다.
+            if self.nhwc and current_tf_input_numpy.ndim == 4 and current_tf_input_numpy.shape[1] == 3: # BCHW 형태일 때
+                 current_tf_input_numpy = current_tf_input_numpy.transpose(0, 2, 3, 1) # BHWC로 변경
+
+            # 여기서부터 TensorFlow 관련 로직 (current_tf_input_numpy 사용)
+            # 사용자의 오류 로그 (common.py line 763: b, ch, h, w = im.shape)는
+            # 이 블록 내에서 원본 'im' (리스트)을 참조하여 발생했을 가능성이 있습니다.
+            # 모든 'im' 참조를 'current_tf_input_numpy'로 변경해야 합니다.
+            
+            # 예를 들어, y[0][..., :4] *= [w, h, w, h] 부분에서 w, h를 사용하는데,
+            # 이 w, h는 입력 이미지의 실제 너비, 높이여야 합니다.
+            # current_tf_input_numpy.shape에서 가져오거나, dataloader에서 전달받은 원본 shape 사용.
+            # 여기서는 current_tf_input_numpy가 BHWC라면 (H, W) = shape[1], shape[2]
+            # BCHW라면 (H, W) = shape[2], shape[3]
+            # 아래는 BCHW를 가정하고 NHWC로 바꾼 후의 예시 (w,h 설정)
+            if self.nhwc:
+                b_tf, h_tf, w_tf, ch_tf = current_tf_input_numpy.shape
+            else: # BCHW (numpy)
+                b_tf, ch_tf, h_tf, w_tf = current_tf_input_numpy.shape
+
+
             if self.saved_model:  # SavedModel
-                y = self.model(im, training=False) if self.keras else self.model(im)
+                y = self.model(current_tf_input_numpy, training=False) if self.keras else self.model(current_tf_input_numpy)
             elif self.pb:  # GraphDef
-                y = self.frozen_func(x=self.tf.constant(im))
+                y = self.frozen_func(x=tf.constant(current_tf_input_numpy))
             else:  # Lite or Edge TPU
-                input = self.input_details[0]
-                int8 = input["dtype"] == np.uint8  # is TFLite quantized uint8 model
-                if int8:
-                    scale, zero_point = input["quantization"]
-                    im = (im / scale + zero_point).astype(np.uint8)  # de-scale
-                self.interpreter.set_tensor(input["index"], im)
+                input_details_tf = self.input_details[0] # self.input_details는 __init__에서 설정됨
+                int8_tf = input_details_tf["dtype"] == np.uint8
+                input_to_tflite = current_tf_input_numpy # 이미 NHWC 또는 모델이 기대하는 형태여야 함
+                if int8_tf:
+                    scale, zero_point = input_details_tf["quantization"]
+                    input_to_tflite = (input_to_tflite / scale + zero_point).astype(np.uint8)
+                self.interpreter.set_tensor(input_details_tf["index"], input_to_tflite)
                 self.interpreter.invoke()
                 y = []
-                for output in self.output_details:
-                    x = self.interpreter.get_tensor(output["index"])
-                    if int8:
-                        scale, zero_point = output["quantization"]
-                        x = (x.astype(np.float32) - zero_point) * scale  # re-scale
-                    y.append(x)
-            y = [x if isinstance(x, np.ndarray) else x.numpy() for x in y]
-            y[0][..., :4] *= [w, h, w, h]  # xywh normalized to pixels
+                for output_detail_tf in self.output_details: # self.output_details는 __init__에서 설정됨
+                    x_tf = self.interpreter.get_tensor(output_detail_tf["index"])
+                    if int8_tf:
+                        scale_tf, zero_point_tf = output_detail_tf["quantization"]
+                        x_tf = (x_tf.astype(np.float32) - zero_point_tf) * scale_tf
+                    y.append(x_tf)
+            
+            # TensorFlow 결과 후처리 (y는 numpy 배열 리스트 또는 단일 배열일 수 있음)
+            y = [x_item if isinstance(x_item, np.ndarray) else x_item.numpy() for x_item in y] # 모든 요소를 numpy로
+            # y[0]은 주로 탐지 결과 (예: [N, 6] 형태의 xywh, conf, cls). 좌표 정규화 해제.
+            # 여기서 w_tf, h_tf는 TensorFlow 입력에 사용된 이미지의 너비, 높이.
+            if y and isinstance(y[0], np.ndarray) and y[0].ndim >=2 and y[0].shape[-1] >=4 :
+                 y[0][..., :4] *= [w_tf, h_tf, w_tf, h_tf]
 
+
+        # --- 최종 출력 변환 ---
+        # y는 다양한 백엔드로부터 다양한 형태로 반환될 수 있음 (텐서, 넘파이 배열, 리스트 등)
+        # from_numpy는 최종적으로 torch 텐서로 변환 (필요시)
         if isinstance(y, (list, tuple)):
-            return self.from_numpy(y[0]) if len(y) == 1 else [self.from_numpy(x) for x in y]
-        else:
+            # RGBT PyTorch 모델의 출력이 (preds, train_out) 형태의 튜플일 수 있고, 여기서 preds만 사용.
+            # 또는 다른 백엔드가 여러 출력을 리스트로 반환할 수 있음.
+            # 여기서는 첫 번째 요소를 주 예측으로 간주하거나, 모든 요소를 텐서 리스트로 변환.
+            # 이 부분은 각 백엔드 출력의 실제 형태에 따라 조정 필요.
+            # 가장 일반적인 경우는 y가 단일 예측 텐서이거나, [예측텐서] 형태의 리스트.
+            if len(y) == 1 and not isinstance(y[0], (list, tuple)): # [텐서] 형태
+                return self.from_numpy(y[0])
+            else: # 튜플이거나, 여러 출력을 가진 리스트 등
+                  # (예: yolov5 PyTorch 모델은 (preds, List[torch.Tensor]))
+                  # RGBT 모델이 [pred_rgb, pred_lwir]을 반환하지는 않을 것임. 융합된 단일 pred를 반환할 것.
+                  # 따라서 y가 리스트/튜플이어도, 실제 detection 결과는 보통 첫번째 요소.
+                  # 또는 모델 설계에 따라 다름.
+                  # 가장 안전한 것은 self.from_numpy를 각 요소에 적용하는 것 (만약 y가 [np_arr1, np_arr2] 라면)
+                  # 하지만 보통은 단일 최종 예측을 반환.
+                if self.pt and isinstance(y, tuple) and len(y) > 0 : # PyTorch 모델의 (preds, train_outputs) 경우
+                    return self.from_numpy(y[0]) # preds 부분만 사용
+                elif isinstance(y, list) and all(isinstance(i, (torch.Tensor, np.ndarray)) for i in y):
+                    return [self.from_numpy(x) for x in y]
+                else: # 예측할 수 없는 다른 형태
+                    return self.from_numpy(y) # 일단 시도
+        else: # y가 단일 텐서 또는 numpy 배열인 경우
             return self.from_numpy(y)
 
     def from_numpy(self, x):

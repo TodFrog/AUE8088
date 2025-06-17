@@ -1,6 +1,6 @@
 # hyp.kaist_stage2_refine.yaml
-lr0: 0.0001              # 초기 학습률 유지 (동결 시에도 미세 조정)
-lrf: 0.00001             # 최종 학습률 비율 유지
+lr0: 0.001
+lrf: 0.01
 momentum: 0.937
 weight_decay: 0.0005
 warmup_epochs: 3.0
@@ -9,9 +9,9 @@ warmup_bias_lr: 0.1
 
 # ---------- Loss 가중치 ----------
 box: 0.05
-cls: 0.50                # cls 가중치 유지
-obj: 1.00                # obj 가중치 유지
-fl_gamma: 0.0
+cls: 0.30              # 배경이 많고 Miss Rate 감소 목표이므로 cls 가중치 더 감소
+obj: 1.50              # Miss Rate 감소를 위해 obj 가중치 증가 (객체 존재 여부 판단 강화)
+fl_gamma: 0.0          # Focal Loss 비활성화 유지 (Miss Rate 감소에 집중)
 cls_pw: 1.0
 obj_pw: 1.0
 # ---------- IoU ----------
@@ -22,16 +22,16 @@ anchor_t: 4.0
 
 # ---------- 기하 증강 ----------
 degrees: 0.0             # 회전 증강 비활성화 유지
-translate: 0.05          # 이동 증강 강도 유지
-scale: 0.15              # 스케일 증강 강도 유지
+translate: 0.05         # 이동 증강 강도 유지
+scale: 0.10              # 스케일 증강 강도 유지
 shear: 0.0               # 전단 증강 비활성화 유지
 perspective: 0.0         # 원근 증강 비활성화 유지
-mosaic: 0.00             # Mosaic 비활성화 유지 (초기에는 큰 변화 방지)
-mixup: 0.00              # Mixup 비활성화 유지
+mosaic: 0.0             # Mosaic 비활성화 유지 (초기에는 큰 변화 방지)
+mixup: 0.0              # Mixup 비활성화 유지
 
 # ---------- 색상 (Visible 전용) ----------
 hsv_h: 0.01              # 색조 증강 강도 유지
-hsv_s: 0.07              # 채도 증강 강도 유지
-hsv_v: 0.05              # 명도 증강 강도 유지
+hsv_s: 0.01              # 채도 증강 강도 유지
+hsv_v: 0.01              # 명도 증강 강도 유지
 flipud: 0.0              # 수직 뒤집기 비활성화 유지
-fliplr: 0.50             # 수평 뒤집기 다시 활성화 (가장 일반적이고 효과적인 증강)
+fliplr: 0.5             # 수평 뒤집기 다시 활성화 (가장 일반적이고 효과적인 증강)
